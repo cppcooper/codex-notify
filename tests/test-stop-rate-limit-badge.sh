@@ -314,6 +314,96 @@ printf '%s\n' '{"session_id":"sess1"}' | \
     || fail "new prompt must reset the delegated spinner"
 pass "new prompt restores the normal running spinner"
 
+# A teammate is listed as running in the Stop payload whether it works or is
+# parked; only an unanswered SubagentStart says it works. While it works, the
+# lead's Stop and idle reminder still notify, but the window keeps the clock
+# spinner instead of the completion badge.
+run_claude_event() {
+    local event="$1" data="$2"
+    printf '%s\n' "$data" | \
+        CODE_NOTIFY_TAIL_SYNC=1 CODE_NOTIFY_SKIP_USAGE_CHECK=1 \
+        CODE_NOTIFY_NOTIFICATION_RATE_LIMIT_SECONDS=0 \
+        bash "$ROOT_DIR/lib/code-notify/core/notifier.sh" "$event" claude proj \
+        >/dev/null 2>&1 || fail "$event should exit cleanly"
+}
+teammate_stop='{"session_id":"sess1","background_tasks":[{"type":"teammate","status":"running"}]}'
+printf '%s' 'stop|idle_prompt|SubagentStart|TeammateIdle' \
+    > "$HOME/.claude/notifications/notify-types"
+touch "$HOME/.claude/notifications/tmux-spinner-enabled"
+reset_window
+rm -f "$state_dir/@1.@code_notify_delegated" "$state_dir/@1.@code_notify_teammate_busy"
+date +%s > "$state_dir/@1.@code_notify_running"
+run_claude_event SubagentStart '{"session_id":"sess1"}'
+[[ -s "$state_dir/@1.@code_notify_teammate_busy" ]] \
+    || fail "SubagentStart must record the unanswered teammate start"
+: > "$deliver_log"
+run_stop --hook-data "$teammate_stop" CODE_NOTIFY_STOP_RATE_LIMIT_SECONDS=0
+[[ -s "$state_dir/@1.@code_notify_running" && "$(cat "$state_dir/@1.@code_notify_delegated")" == "1" ]] \
+    || fail "Stop with a working teammate must keep the clock spinner"
+[[ "$(window_name)" == "proj" ]] \
+    || fail "Stop with a working teammate must not badge over the spinner (got: $(window_name))"
+[[ -s "$deliver_log" ]] || fail "Stop with a working teammate must still notify"
+[[ "$(tail -n 1 "$HOME/.claude/logs/notifications.log" 2>/dev/null)" == *teammate* ]] \
+    || fail "Stop with a working teammate must say the teammate still runs"
+
+: > "$deliver_log"
+run_claude_event notification '{"session_id":"sess1","notification_type":"idle_prompt"}'
+[[ -s "$state_dir/@1.@code_notify_running" && "$(window_name)" == "proj" ]] \
+    || fail "idle reminder while a teammate works must keep the spinner"
+[[ -s "$deliver_log" ]] || fail "idle reminder while a teammate works must still notify"
+[[ "$(tail -n 1 "$HOME/.claude/logs/notifications.log" 2>/dev/null)" == *teammate* ]] \
+    || fail "idle reminder while a teammate works must say the teammate still runs"
+
+run_claude_event UserPromptSubmit '{"session_id":"sess1"}'
+[[ ! -e "$state_dir/@1.@code_notify_queued_prompt" ]] \
+    || fail "a held teammate spinner is not a queued-successor turn"
+run_stop --hook-data "$teammate_stop" CODE_NOTIFY_STOP_RATE_LIMIT_SECONDS=0
+[[ "$(cat "$state_dir/@1.@code_notify_delegated" 2>/dev/null)" == "1" && "$(window_name)" == "proj" ]] \
+    || fail "a later lead Stop must hold the clock while the teammate still works"
+
+run_claude_event TeammateIdle '{"session_id":"sess1"}'
+[[ ! -e "$state_dir/@1.@code_notify_teammate_busy" && ! -e "$state_dir/@1.@code_notify_delegated" ]] \
+    || fail "TeammateIdle must answer the teammate start and drop the clock"
+[[ -s "$state_dir/@1.@code_notify_running" ]] \
+    || fail "TeammateIdle must keep the spinner for the lead picking up the report"
+run_stop --hook-data "$teammate_stop" CODE_NOTIFY_STOP_RATE_LIMIT_SECONDS=0
+[[ ! -s "$state_dir/@1.@code_notify_running" && "$(window_name)" == "🟢 proj" ]] \
+    || fail "Stop with only a parked teammate must complete (got: $(window_name))"
+
+reset_window
+date +%s > "$state_dir/@1.@code_notify_running"
+date +%s > "$state_dir/@1.@code_notify_teammate_busy"
+run_stop --hook-data '{"session_id":"sess1","background_tasks":[]}' \
+    CODE_NOTIFY_STOP_RATE_LIMIT_SECONDS=0
+[[ "$(window_name)" == "🟢 proj" && ! -e "$state_dir/@1.@code_notify_teammate_busy" ]] \
+    || fail "Stop with no running teammate must complete and drop a stale teammate start"
+
+# A queued prompt's hint must survive a teammate hold that lands after it: a
+# later queued prompt must not clear it, or the running turn's Stop runs that
+# successor dark once the teammate retires.
+reset_window
+rm -f "$state_dir/@1.@code_notify_delegated" "$state_dir/@1.@code_notify_teammate_busy" \
+    "$state_dir/@1.@code_notify_queued_prompt"
+date +%s > "$state_dir/@1.@code_notify_running"
+run_claude_event SubagentStart '{"session_id":"sess1"}'
+run_claude_event UserPromptSubmit '{"session_id":"sess1"}'
+[[ -s "$state_dir/@1.@code_notify_queued_prompt" ]] \
+    || fail "a prompt queued behind a running turn must leave the hint"
+run_stop --hook-data "$teammate_stop" CODE_NOTIFY_STOP_RATE_LIMIT_SECONDS=0
+[[ "$(cat "$state_dir/@1.@code_notify_delegated" 2>/dev/null)" == "1" ]] \
+    || fail "a late Stop with a working teammate must hold the clock"
+run_claude_event UserPromptSubmit '{"session_id":"sess1"}'
+[[ -s "$state_dir/@1.@code_notify_queued_prompt" ]] \
+    || fail "a prompt after a teammate hold must keep the existing hint"
+run_claude_event TeammateIdle '{"session_id":"sess1"}'
+run_stop --hook-data "$teammate_stop" CODE_NOTIFY_STOP_RATE_LIMIT_SECONDS=0
+[[ -s "$state_dir/@1.@code_notify_running" && "$(window_name)" == "proj" ]] \
+    || fail "the preserved hint must keep the queued successor's spinner (got: $(window_name))"
+[[ ! -e "$state_dir/@1.@code_notify_queued_prompt" ]] \
+    || fail "the Stop must consume the preserved hint"
+rm -f "$HOME/.claude/notifications/tmux-spinner-enabled"
+pass "a working teammate keeps the clock spinner without holding back notifications"
+
 reset_window
 date +%s > "$state_dir/@1.@code_notify_running"
 printf '%s\n' '{"session_id":"sess1","notification_type":"permission_prompt"}' | \

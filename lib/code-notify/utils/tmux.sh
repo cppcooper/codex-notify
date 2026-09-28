@@ -2307,6 +2307,79 @@ tmux_spinner_delegated_set_current() {
     fi
 }
 
+# Claude teammates: a Stop payload lists a parked teammate as running, just like
+# a working one, so the payload alone cannot say whether a teammate works.
+# @code_notify_teammate_busy records a delegate start (SubagentStart) that no
+# TeammateIdle or SubagentStop has yet answered. It only changes the tmux
+# rendering: toasts, sounds and voice are never held back for a teammate.
+#
+# tmux_teammate_busy_set_current on|off — set or clear it for the hook's window.
+tmux_teammate_busy_set_current() {
+    tmux_focus_available || return 0
+    local target session_id window_id pane_id
+    target=$(tmux_focus_capture_target) || return 0
+    read -r session_id window_id pane_id <<< "$target"
+    [[ "$window_id" =~ ^@[0-9]+$ ]] || return 0
+    if [[ "$1" == "on" ]]; then
+        tmux set-option -w -t "$window_id" @code_notify_teammate_busy "$(date +%s)" 2>/dev/null
+    else
+        tmux set-option -wu -t "$window_id" @code_notify_teammate_busy 2>/dev/null
+    fi
+}
+
+# Succeeds when the hook's window has an unanswered teammate start.
+tmux_teammate_busy_current() {
+    tmux_focus_available || return 1
+    local target session_id window_id pane_id busy
+    target=$(tmux_focus_capture_target) || return 1
+    read -r session_id window_id pane_id <<< "$target"
+    [[ "$window_id" =~ ^@[0-9]+$ ]] || return 1
+    busy=$(tmux show-options -wqv -t "$window_id" @code_notify_teammate_busy 2>/dev/null)
+    [[ "$busy" =~ ^[0-9]+$ ]]
+}
+
+# Keep the running spinner up past a lead Stop while a teammate works, drawn as
+# the delegated-work clock. Succeeds only when the window's running epoch is
+# still live, so the caller skips its teardown and the terminal badge yields to
+# the spinner. Fails (and changes nothing) otherwise, and the caller runs its
+# normal Stop.
+tmux_teammate_hold_current() {
+    tmux_focus_available || return 1
+    tmux_running_spinner_enabled || return 1
+    local target session_id window_id pane_id since now held=1
+    target=$(tmux_focus_capture_target) || return 1
+    read -r session_id window_id pane_id <<< "$target"
+    [[ "$window_id" =~ ^@[0-9]+$ ]] || return 1
+    tmux_running_transition_lock_acquire "$window_id" || return 1
+    local transition_lock="$TMUX_RUNNING_TRANSITION_LOCKDIR"
+    local transition_token="$TMUX_RUNNING_TRANSITION_LOCKTOKEN"
+    since=$(tmux show-options -wqv -t "$window_id" @code_notify_running 2>/dev/null)
+    now=$(date +%s)
+    if [[ "$since" =~ ^[0-9]+$ ]] && (( now - since < TMUX_RUNNING_TTL )); then
+        tmux set-option -w -t "$window_id" @code_notify_delegated 1 2>/dev/null
+        held=0
+    fi
+    tmux_running_transition_lock_release "$transition_lock" "$transition_token"
+    (( held == 0 )) || return 1
+    tmux_spinner_sync_delegated_preference 2>/dev/null || true
+    tmux_spinner_arm 2>/dev/null || true
+    return 0
+}
+
+# Succeeds while the hook's window holds its spinner for a working teammate.
+# Claude's native idle reminder then describes the lead waiting on that
+# teammate, so it must not take the spinner down.
+tmux_teammate_hold_active_current() {
+    tmux_focus_available || return 1
+    local target session_id window_id pane_id
+    target=$(tmux_focus_capture_target) || return 1
+    read -r session_id window_id pane_id <<< "$target"
+    [[ "$window_id" =~ ^@[0-9]+$ ]] || return 1
+    [[ "$(tmux show-options -wqv -t "$window_id" @code_notify_teammate_busy 2>/dev/null)" =~ ^[0-9]+$ ]] &&
+        [[ "$(tmux show-options -wqv -t "$window_id" @code_notify_delegated 2>/dev/null)" == "1" ]] &&
+        [[ "$(tmux show-options -wqv -t "$window_id" @code_notify_running 2>/dev/null)" =~ ^[0-9]+$ ]]
+}
+
 # The status-line snippet: while this window's @code_notify_running epoch is
 # fresher than the TTL, show a moon or delegated-work clock frame for the current
 # wall-clock second, each followed by a separator space;
@@ -2873,6 +2946,8 @@ tmux_prompt_submit() {
     tmux_running_transition_lock_acquire "$window_id" || return 0
     local transition_lock="$TMUX_RUNNING_TRANSITION_LOCKDIR"
     local transition_token="$TMUX_RUNNING_TRANSITION_LOCKTOKEN"
+    local prev_delegated
+    prev_delegated=$(tmux show-options -wqv -t "$window_id" @code_notify_delegated 2>/dev/null)
     tmux set-option -wu -t "$window_id" @code_notify_delegated 2>/dev/null
 
     # A submission that arrives while this window's running marker is still
@@ -2895,12 +2970,23 @@ tmux_prompt_submit() {
     # queued successor with no indicator and a stale completion badge for its
     # whole run: unbounded, and pointing the wrong way (idle while working),
     # against a bounded few-second badge delay for the false-hint case.
+    #
+    # A marker kept up for delegated work belongs to no turn: its Stop already
+    # ran, so it sets no hint. It keeps an existing hint, though. A delegate
+    # Stop can land after a queued prompt set one (the prompt hook is the
+    # cheaper of the two), and that Stop skips the teardown that consumes it.
+    # The hint then still guards the running turn; clearing it here would let
+    # that turn's Stop, once the delegate retires, run a later queued
+    # successor dark. The hint keeps its original epoch, so its TTL still
+    # holds, and a preserve it causes with no successor running is retired by
+    # the settle watch the consuming Stop arms.
     local prev_running now_epoch
     now_epoch="$(date +%s)"
     prev_running=$(tmux show-options -wqv -t "$window_id" @code_notify_running 2>/dev/null)
-    if [[ "$prev_running" =~ ^[0-9]+$ ]] && (( now_epoch - prev_running < TMUX_RUNNING_TTL )); then
+    if [[ -z "$prev_delegated" ]] && [[ "$prev_running" =~ ^[0-9]+$ ]] &&
+        (( now_epoch - prev_running < TMUX_RUNNING_TTL )); then
         tmux set-option -w -t "$window_id" @code_notify_queued_prompt "$now_epoch" 2>/dev/null
-    else
+    elif [[ -z "$prev_delegated" ]]; then
         tmux set-option -wu -t "$window_id" @code_notify_queued_prompt 2>/dev/null
     fi
 

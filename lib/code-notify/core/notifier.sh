@@ -1364,6 +1364,54 @@ print(state, end="")
     esac
 }
 
+# Succeeds when the Stop payload lists a running teammate. A parked teammate
+# also passes, so callers pair this with the window's unanswered teammate
+# start (tmux_teammate_busy_current).
+claude_payload_has_running_teammate() {
+    local found=""
+    if has_jq; then
+        found=$(printf '%s' "$HOOK_DATA" | jq -r '
+            if (.background_tasks | type) == "array" then
+                any(.background_tasks[]?;
+                    type == "object"
+                    and (.type == "teammate" or .type == "in_process_teammate")
+                    and (.status == "running" or .status == "pending"))
+            else false end
+        ' 2>/dev/null) || found=""
+    elif has_python3; then
+        found=$(printf '%s' "$HOOK_DATA" | python3 -c '
+import json, sys
+try:
+    tasks = json.load(sys.stdin).get("background_tasks")
+    ok = isinstance(tasks, list) and any(
+        isinstance(t, dict)
+        and t.get("type") in ("teammate", "in_process_teammate")
+        and t.get("status") in ("running", "pending")
+        for t in tasks
+    )
+except Exception:
+    ok = False
+print("true" if ok else "false", end="")
+' 2>/dev/null) || found=""
+    fi
+    [[ "$found" == "true" ]]
+}
+
+# Stop with a teammate still working: keep the tmux spinner up as the
+# delegated-work clock instead of tearing it down. Delivery is unchanged.
+# A window whose teammate start is unanswered but whose payload lists no
+# running teammate drops that stale record.
+claude_teammate_hold_spinner() {
+    [[ "$TOOL_NAME" == "claude" ]] && [[ "$HOOK_TYPE" == "stop" ]] || return 1
+    [[ -n "${TMUX:-}" ]] || return 1
+    tmux_teammate_busy_current || return 1
+    if ! claude_payload_has_running_teammate; then
+        tmux_teammate_busy_set_current off 2>/dev/null || true
+        return 1
+    fi
+    tmux_teammate_hold_current
+}
+
 mark_delegated_work_running() {
     local marker_file marker_tmp spinner_snip
     marker_file=$(get_delegated_work_marker_file) || return 0
@@ -1834,13 +1882,28 @@ fi
 # failure direction this feature is designed to avoid. The next Stop
 # snapshot re-arms the marker while delegated work remains, so the cost of
 # eager clearing is at most one early idle reminder in between.
+#
+# Every delegate start also records an unanswered teammate start for the tmux
+# spinner (see tmux_teammate_busy_set_current); SubagentStop and TeammateIdle
+# answer it. On TeammateIdle the lead picks up the teammate's report, so a
+# spinner held for that teammate turns from the clock back to the moon unless
+# a subagent marker still owns the clock.
 if [[ "$TOOL_NAME" == "claude" ]]; then
     case "$HOOK_TYPE" in
+        "SubagentStart")
+            tmux_teammate_busy_set_current on 2>/dev/null || true
+            ;;
         "SubagentStop")
+            tmux_teammate_busy_set_current off 2>/dev/null || true
             clear_delegated_work_marker
             claude_event_alert_enabled "$HOOK_TYPE" || exit 0
             ;;
         "TeammateIdle")
+            if tmux_teammate_busy_current; then
+                tmux_teammate_busy_set_current off 2>/dev/null || true
+                delegated_work_marker_exists ||
+                    tmux_spinner_delegated_set_current off 2>/dev/null || true
+            fi
             claude_event_alert_enabled "$HOOK_TYPE" || exit 0
             ;;
     esac
@@ -1853,6 +1916,11 @@ fi
 # subagent or workflow and clears it.
 if claude_delegated_work_should_suppress; then
     exit 0
+fi
+
+CLAUDE_TEAMMATE_HOLD=0
+if claude_teammate_hold_spinner 2>/dev/null; then
+    CLAUDE_TEAMMATE_HOLD=1
 fi
 
 # Map the current event to the canonical key stored by `cn alerts persist add`.
@@ -1914,6 +1982,13 @@ case "$HOOK_TYPE" in
             "permission_prompt"|"elicitation_dialog")
                 tmux_running_pause_for_input watch 2>/dev/null || true
                 ;;
+            "idle_prompt")
+                if [[ "$TOOL_NAME" == "claude" ]] && tmux_teammate_hold_active_current; then
+                    CLAUDE_TEAMMATE_HOLD=1
+                else
+                    tmux_running_pause_for_input 2>/dev/null || true
+                fi
+                ;;
             *)
                 tmux_running_pause_for_input 2>/dev/null || true
                 ;;
@@ -1943,7 +2018,12 @@ case "$HOOK_TYPE" in
         TMUX_BADGE_RUNNING_GUARD=1
         ;;
     "stop"|"error"|"failed")
-        if [[ "$AGY_STOP_FINAL_CLEANUP" != "1" ]]; then
+        if [[ "$CLAUDE_TEAMMATE_HOLD" == "1" ]]; then
+            # The lead's turn ended but its teammate still works: the spinner
+            # stays up (as the clock) and the running guard lets it keep the
+            # window instead of the terminal badge. The toast still goes out.
+            TMUX_BADGE_RUNNING_GUARD=1
+        elif [[ "$AGY_STOP_FINAL_CLEANUP" != "1" ]]; then
             if [[ "${CODE_NOTIFY_TMUX_STOP_ALREADY_APPLIED:-}" == "1" ]]; then
                 # The settle sweep removed this hook-less turn under the
                 # transition lock before invoking us. Do not run the generic
@@ -2160,6 +2240,20 @@ case "$HOOK_TYPE" in
             "Complete! $TOOL_DISPLAY finished, so take a look whenever it suits you" \
             "All wrapped up! $TOOL_DISPLAY finished, so let me know what you think"
         SOUND="Glass"
+        # The lead's turn ended while a teammate still works (the tmux spinner
+        # stays up as the clock): say both, so the toast does not read as if
+        # all work is finished.
+        if [[ "$CLAUDE_TEAMMATE_HOLD" == "1" ]]; then
+            SUBTITLE="Turn Complete, Teammate Running"
+            set_event_messages \
+                "$TOOL_DISPLAY completed its turn, a teammate is still running" \
+                "$TOOL_DISPLAY is done, a teammate is still working" \
+                "$TOOL_DISPLAY wrapped up, a teammate is still busy" \
+                -- \
+                "Turn complete! $TOOL_DISPLAY is done, but a teammate is still running" \
+                "$TOOL_DISPLAY finished its turn. A teammate is still working in the background" \
+                "Heads up! $TOOL_DISPLAY is done for now, and a teammate is still busy"
+        fi
         ;;
     "notification")
         TITLE="$TOOL_DISPLAY 💬"
@@ -2191,6 +2285,19 @@ case "$HOOK_TYPE" in
                     "Just checking in! $TOOL_DISPLAY has been idle for a bit" \
                     "Still here! $TOOL_DISPLAY is waiting on your next move" \
                     "Gentle poke! $TOOL_DISPLAY would love your attention"
+                # The window holds the clock for a working teammate: the lead
+                # is idle, but the work is not done.
+                if [[ "$CLAUDE_TEAMMATE_HOLD" == "1" ]]; then
+                    SUBTITLE="Idle, Teammate Running"
+                    set_event_messages \
+                        "$TOOL_DISPLAY is idle, a teammate is still running" \
+                        "$TOOL_DISPLAY is waiting, a teammate is still working" \
+                        "$TOOL_DISPLAY is standing by, a teammate is still busy" \
+                        -- \
+                        "Just so you know! $TOOL_DISPLAY is idle, but a teammate is still running" \
+                        "$TOOL_DISPLAY is waiting for you. A teammate is still working in the background" \
+                        "Friendly nudge! $TOOL_DISPLAY is idle while a teammate is still busy"
+                fi
                 ;;
             "permission_prompt")
                 set_event_messages \
