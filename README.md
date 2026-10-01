@@ -725,7 +725,7 @@ Notes:
 - Synthesized audio is cached in `~/.cache/code-notify/tts/`, so repeated selected phrases do not make repeat API calls. Cache filenames include the project name and their timestamp is refreshed on use, making stale entries easy to prune by age.
 - A failed synthesis (outage, invalid key, quota) is not retried for the same phrase within `CODE_NOTIFY_TTS_FAIL_BACKOFF_SECONDS` (default 30, 0 disables) — a burst of identical events during an outage makes one request, and the rest fall back to `say` immediately instead of each repeating the doomed call.
 - Your API key is stored locally in `~/.config/code-notify/tts.json` (permissions `600`) and is redacted in `cn voice status`.
-- `eleven_flash_v2_5` is the default model — it is the fastest and cheapest, which suits short notification phrases. Use `eleven_multilingual_v2` for higher quality.
+- `eleven_flash_v2_5` is the default model — it is the fastest and cheapest, which suits short notification phrases. Use `eleven_multilingual_v2` for higher quality, `eleven_v3` or `eleven_v4` for the most expressive speech (not real-time), or `eleven_v4_turbo` for real-time speech (~150 ms to first audio). `eleven_v3_conversational` is the older real-time model. Run `cn voice elevenlabs model` with no id to list them.
 
 #### Free-tier voices and preview links
 

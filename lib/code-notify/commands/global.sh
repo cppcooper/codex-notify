@@ -1180,7 +1180,18 @@ handle_voice_elevenlabs_command() {
             ;;
         "model")
             local model_id="${1:-}"
-            [[ -n "$model_id" ]] || { error "Usage: cn voice elevenlabs model <model-id>"; return 1; }
+            if [[ -z "$model_id" ]]; then
+                error "Usage: cn voice elevenlabs model <model-id>"
+                echo "Current model: $(tts_elevenlabs_model_id)"
+                echo "Model ids:"
+                echo "  eleven_flash_v2_5         Fast and cheap (default)"
+                echo "  eleven_multilingual_v2    Higher quality, slower"
+                echo "  eleven_v3                 Expressive, for produced audio"
+                echo "  eleven_v3_conversational  Real-time (~280 ms); older, replaced by v4_turbo"
+                echo "  eleven_v4                 Best quality, for produced audio; not real-time"
+                echo "  eleven_v4_turbo           Real-time (~150 ms to first speech), best for live alerts"
+                return 1
+            fi
             tts_set_value "elevenlabs.model_id" "$model_id" && success "ElevenLabs model set to: $model_id"
             ;;
         "list")
