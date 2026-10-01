@@ -1193,8 +1193,9 @@ handle_voice_elevenlabs_command() {
                 echo "  cn voice elevenlabs key <api-key>"
                 return 1
             fi
+            local test_text="${*:-Code Notify ElevenLabs voice is working}"
             info "Speaking test message via ElevenLabs..."
-            if tts_elevenlabs_speak "Code Notify ElevenLabs voice is working"; then
+            if tts_elevenlabs_speak "$test_text"; then
                 success "ElevenLabs test complete"
             else
                 if [[ -n "${TTS_LAST_ERROR:-}" ]]; then
@@ -1243,7 +1244,7 @@ show_elevenlabs_status() {
     echo "  ${CYAN}cn voice elevenlabs voice <id>${RESET}      Set voice id"
     echo "  ${CYAN}cn voice elevenlabs model <id>${RESET}      Set model id"
     echo "  ${CYAN}cn voice elevenlabs list${RESET}            List available voices"
-    echo "  ${CYAN}cn voice elevenlabs test${RESET}            Speak a test message"
+    echo "  ${CYAN}cn voice elevenlabs test [text]${RESET}     Speak a test message (or your own text)"
 }
 
 # Show detailed voice status
