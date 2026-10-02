@@ -712,7 +712,7 @@ cn voice on                                  # Enable voice first
 cn voice engine elevenlabs                   # Switch TTS engine
 cn voice elevenlabs key <your-api-key>       # Store your API key
 cn voice elevenlabs list                     # List voices (with category + plan)
-cn voice elevenlabs voice <voice-id>         # Pick a voice (default: Rachel)
+cn voice elevenlabs voice [voice-id]         # Show or pick a voice (default: Rachel)
 cn voice elevenlabs model <model-id>         # Default: eleven_flash_v2_5
 cn voice elevenlabs test [text]              # Speak a test message (or your own text)
 cn voice engine system                       # Switch back to the built-in voice

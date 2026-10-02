@@ -1175,7 +1175,10 @@ handle_voice_elevenlabs_command() {
             ;;
         "voice")
             local voice_id="${1:-}"
-            [[ -n "$voice_id" ]] || { error "Usage: cn voice elevenlabs voice <voice-id>"; return 1; }
+            if [[ -z "$voice_id" ]]; then
+                echo "Current voice: $(tts_elevenlabs_voice_id)"
+                return 0
+            fi
             tts_set_value "elevenlabs.voice_id" "$voice_id" && success "ElevenLabs voice set to: $voice_id"
             ;;
         "model")
@@ -1252,7 +1255,7 @@ show_elevenlabs_status() {
     echo ""
     info "Commands:"
     echo "  ${CYAN}cn voice elevenlabs key <api-key>${RESET}   Store your API key"
-    echo "  ${CYAN}cn voice elevenlabs voice <id>${RESET}      Set voice id"
+    echo "  ${CYAN}cn voice elevenlabs voice [id]${RESET}      Show or set voice id"
     echo "  ${CYAN}cn voice elevenlabs model <id>${RESET}      Set model id"
     echo "  ${CYAN}cn voice elevenlabs list${RESET}            List available voices"
     echo "  ${CYAN}cn voice elevenlabs test [text]${RESET}     Speak a test message (or your own text)"
