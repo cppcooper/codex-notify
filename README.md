@@ -84,7 +84,7 @@ This first CalVer release collects the fork-specific work since upstream
 - **Voice announcements** - Hear when tasks complete (macOS, Windows)
 - **ElevenLabs voices** - Optional high-quality cloud TTS for voice announcements (macOS)
 - **Slack/Discord/ntfy delivery** - Mirror notifications to webhooks or your phone
-- **Codex hook ownership** - Handles Codex completion and approval/edit requests through Codex hooks while disabling duplicate Codex TUI toasts
+- **Codex attention alerts** - Turn completion through Codex hooks; `cn codex` adds human approval and blocking question alerts in ordinary terminals. Opt into every approval request, including Auto-review, with `cn alerts add approval_request`
 - **Usage alerts** - Opt-in Codex/Claude 20%, 10%, and reset notifications
 - **Rotating tool-specific messages** - "Claude is idle", "Codex wrapped up", and other short variants are chosen randomly per event
 - **Project-specific settings** - Different configs per project
@@ -182,6 +182,7 @@ See [docs/installation.md](docs/installation.md) for more details.
 | `cn on all`          | Explicit alias for enabling all detected tools |
 | `cn on claude`       | Enable for Claude Code only                  |
 | `cn on codex`        | Enable Codex hooks and suppress duplicate Codex TUI toasts |
+| `cn codex [args]`    | Run Codex with human approval and blocking question alerts |
 | `cn on gemini`       | Enable for Gemini CLI only                   |
 | `cn on antigravity`  | Enable for Antigravity CLI (`agy`); `cn on agy` also works |
 | `cn on opencode`     | Enable for opencode (installs a plugin in its config directory) |
@@ -361,7 +362,34 @@ Code-Notify uses the hook systems built into AI coding tools:
 - **pi**: extension at `~/.pi/agent/extensions/code-notify.ts`
 - **omp (oh-my-pi)**: extension at `~/.omp/agent/extensions/code-notify.ts`
 
-For Codex, Code-Notify configures `~/.codex/hooks.json` with Codex lifecycle hooks and disables Codex TUI notifications in `~/.codex/config.toml` to avoid duplicate toasts. The `Stop` hook sends task-complete notifications. When `permission_prompt` is enabled, Code-Notify also adds a `PermissionRequest` hook for approval/edit requests.
+For Codex, Code-Notify configures `$CODEX_HOME/hooks.json` (`~/.codex/hooks.json` by default) with lifecycle hooks. The `Stop` hook sends task-complete notifications, including when you run `codex` directly. Unrelated user hooks and `notify` commands are preserved; `cn off codex` restores the previous TUI notification setting.
+
+To receive alerts when Codex actually needs your approval or answer, launch it through Code-Notify:
+
+```bash
+cn on codex                       # Initial setup; start a fresh Codex session afterward
+cn alerts add permission_prompt   # Human approval needed
+cn alerts add ask_user            # Blocking question needs an answer
+cn codex                          # Your usual Codex terminal interface
+cn codex resume --last            # Codex arguments pass through
+```
+
+`cn codex` observes the requests sent to the terminal client through Codex's normal local app-server daemon. It does not answer requests or change thread settings. Approvals use `permission_prompt`; blocking questions use `ask_user`; MCP input uses `elicitation_dialog`. All use the existing notifier, sounds, voice, channels, persistence and optional tmux badges. `cn alerts add/remove/reset` takes effect on subsequent requests in a running session without reinstalling hooks. `cn off codex` and snooze also silence these alerts.
+
+Codex's `PermissionRequest` hook runs before Auto-review/Guardian decides whether human approval is needed. By default, these early requests stay silent; `permission_prompt` reports requests actually routed to the user. Guardian progress, optional questions (`isBlocking: false`), and unknown events stay silent. See the [Codex app-server protocol](https://learn.chatgpt.com/docs/app-server) and [hook reference](https://learn.chatgpt.com/docs/hooks).
+
+To retain notifications for **every approval request**, including requests that Auto-review resolves automatically, opt in through the existing alert settings:
+
+```bash
+cn alerts add approval_request
+cn alerts remove approval_request  # Return to human-wait alerts only
+```
+
+This works with both plain `codex` and `cn codex`. Early alerts say **Approval Requested** and do not mark Codex as waiting for you or stop its running indicator. The setting changes notifications, not Codex's approval policy. If both `approval_request` and `permission_prompt` are enabled, a request can notify at submission and again when it needs your approval. To receive only submission alerts, remove `permission_prompt`. The lightweight dispatcher is installed during Codex setup and reads alert settings on every request, so toggling this setting needs no hook reinstall. Unrelated user hooks are preserved.
+
+When upgrading an enabled install that lacks this dispatcher, `cn alerts add approval_request` installs it automatically. Start a fresh Codex session once to load the new hook; subsequent alert changes take effect in the running session.
+
+**Requirements:** `cn codex` supports macOS/Linux, requires Python 3.8+ and a current Codex CLI with `--remote` and `app-server daemon/proxy` (checked against 0.160.0), and uses the local daemon. Custom `--remote` servers and `--no-daemon` are unsupported by this launcher. Native Windows and plain `codex` support completion and the opt-in `approval_request` alerts; use `cn codex` in WSL for confirmed human waits on Windows. No tmux setup is required. Code-Notify disables duplicate Codex TUI notifications when enabled.
 
 For Antigravity CLI, Code-Notify builds a small plugin and registers it with `agy plugin install`. Antigravity hooks receive their payload on stdin and pass no arguments, so each event runs a tiny wrapper that pipes the payload into the notifier. The mapping reflects what `agy` actually executes today (tested against `agy` 1.1.3; requires 1.1.3+ — older builds reject the flat lifecycle-hook entries in `hooks.json`):
 
@@ -560,8 +588,13 @@ For Codex, it manages hooks like:
     "PermissionRequest": [
       {
         "matcher": "*",
+        "hooks": [{ "type": "command", "command": "notify.sh ApprovalRequest codex" }]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
         "hooks": [
-          { "type": "command", "command": "notify.sh notification codex" }
+          { "type": "command", "command": "notify.sh UserPromptSubmit codex" }
         ]
       }
     ]
@@ -586,7 +619,8 @@ By default, Claude/Gemini input alerts use `idle_prompt`, while Codex always use
 ```bash
 cn alerts                          # Show current config
 cn alerts add permission_prompt    # Also notify on tool permission requests
-cn alerts add ask_user             # Notify immediately when Claude asks a question
+cn alerts add ask_user             # Claude questions / Codex blocking questions
+cn alerts add approval_request     # Every Codex request, including Auto-review
 cn alerts add SubagentStop         # Also notify when Claude subagents finish
 cn alerts remove permission_prompt # Remove permission notifications
 cn alerts reset                    # Back to default (idle_prompt only)
@@ -596,18 +630,19 @@ cn alerts reset                    # Back to default (idle_prompt only)
 | -------------------- | ---------------------------------------------- |
 | `idle_prompt`        | AI is waiting for your input (default)         |
 | `permission_prompt`  | AI needs tool permission (Y/n)                 |
+| `approval_request`   | Every Codex approval request, including Auto-review (opt-in) |
 | `auth_success`       | Authentication success                         |
 | `elicitation_dialog` | MCP tool input needed                          |
-| `ask_user`           | Claude asks a question via AskUserQuestion     |
+| `ask_user`           | Claude asks a question; Codex needs an answer (`cn codex`) |
 | `SubagentStart`      | Claude subagent started                        |
 | `SubagentStop`       | Claude subagent completed                      |
 | `TeammateIdle`       | Claude teammate is waiting for input           |
 | `TaskCreated`        | Claude agent-team task was created             |
 | `TaskCompleted`      | Claude agent-team task completed               |
 
-Alert-type matching applies to Claude Code `Notification` and `PermissionRequest` hooks, Codex `PermissionRequest` hooks, Gemini CLI notification hooks, the Antigravity CLI `PreToolUse` hook, and opencode's permission/question events. For Antigravity, the `PreToolUse` hook is always installed (it doubles as a "still working" signal); `permission_prompt` gates the approval banner at runtime, so changes take effect without reinstalling. `ask_user` is a Claude-only `PreToolUse` hook for `AskUserQuestion`; it is applied immediately when Claude notifications are already enabled. Claude Code agent/team events are separate hook events and are opt-in via `cn alerts add SubagentStop`, `cn alerts add TeammateIdle`, or `cn alerts add TaskCompleted`. After changing alert types, run `cn on` or `cn on codex` again to rewrite the managed hooks (Antigravity needs no rewrite).
+Alert-type matching applies to Claude Code `Notification` and `PermissionRequest` hooks, `cn codex` requests, Gemini CLI notification hooks, the Antigravity CLI `PreToolUse` hook, and opencode's permission/question events. Codex, Antigravity and opencode read their alert settings at runtime; changing them needs no hook rewrite. For Claude, `ask_user` adds a `PreToolUse` hook for `AskUserQuestion` immediately when notifications are already enabled. Claude Code agent/team events are separate hooks and are opt-in via `cn alerts add SubagentStop`, `cn alerts add TeammateIdle`, or `cn alerts add TaskCompleted`. Other Claude/Gemini hook changes may need `cn on`.
 
-Agent-team and subagent workflows can be noisy if `permission_prompt` is enabled. If you only want idle pings for Claude/Gemini and completion alerts for Codex, run `cn alerts remove permission_prompt && cn on`. Codex exposes no native `idle_prompt` hook, and neither do Antigravity or opencode; inside tmux, the `idle_prompt` alert type instead gates the tmux-derived post-completion idle reminder for all three (see the feature list above). `permission_prompt` controls Codex approval/edit alerts through `PermissionRequest`.
+Agent-team and subagent workflows can be noisy if `permission_prompt` is enabled. Remove it with `cn alerts remove permission_prompt`; this immediately silences confirmed Codex approval-wait alerts. Remove `approval_request` too if you enabled submission alerts. Codex exposes no native `idle_prompt` hook, and neither do Antigravity or opencode; inside tmux, `idle_prompt` gates their post-completion idle reminder. Codex completion remains enabled independently of these optional alert types.
 
 For each delivered event, Code-Notify randomly chooses from a small set of short messages for that event. For example, an `idle_prompt` may say `Claude is idle`, `Claude is waiting`, `Claude is ready for you`, or `Claude can take more work now`.
 

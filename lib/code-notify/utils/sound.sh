@@ -247,6 +247,9 @@ sound_event_candidates() {
                     ;;
             esac
             ;;
+        "ApprovalRequest")
+            printf '%s\n' "permission question"
+            ;;
         "PreToolUse")
             # AskUserQuestion
             printf '%s\n' "question permission"

@@ -412,18 +412,18 @@ function Update-CodexHooksFile {
                 }
             )
         }
-        if (Test-NotifyTypeEnabled -Type "permission_prompt") {
-            $permissionEntries += [PSCustomObject]@{
-                matcher = "*"
-                hooks = @(
-                    [PSCustomObject]@{
-                        type = "command"
-                        command = $permissionCommand
-                        timeout = 5
-                        statusMessage = "Notifying approval request"
-                    }
-                )
-            }
+        # Always install the dispatcher so live alert changes need no reinstall.
+        # It exits unless the user opts into requests before Auto-review.
+        $permissionEntries += [PSCustomObject]@{
+            matcher = "*"
+            hooks = @(
+                [PSCustomObject]@{
+                    type = "command"
+                    command = $permissionCommand
+                    timeout = 5
+                    statusMessage = "Checking approval request alerts"
+                }
+            )
         }
     }
 
@@ -716,6 +716,7 @@ function Get-SoundEventCandidates {
             }
         }
         "PreToolUse" { return @("question", "permission") }
+        "ApprovalRequest" { return @("permission", "question") }
         "SubagentStart" { return @("subagent-start", "SubagentStart", "notification", "idle") }
         "SubagentStop" { return @("subagent-stop", "SubagentStop", "complete", "idle") }
         "TeammateIdle" { return @("teammate-idle", "TeammateIdle", "idle") }
@@ -1051,7 +1052,7 @@ function Get-CodexStopCommand {
 
 function Get-CodexPermissionCommand {
     param([string]$NotifyScript)
-    return "powershell -ExecutionPolicy Bypass -File `"$NotifyScript`" notification codex"
+    return "powershell -ExecutionPolicy Bypass -File `"$NotifyScript`" ApprovalRequest codex"
 }
 
 function Get-ManagedClaudeNotificationPattern {
@@ -1071,7 +1072,7 @@ function Get-ManagedClaudeEventPattern {
 }
 
 function Get-ManagedCodexHookPattern {
-    return '(code-notify.*notifier\.sh|(?:^|[\\/])notify\.(?:ps1|sh)).*(stop|notification)\s+codex(?:\s|$)'
+    return '(code-notify.*notifier\.sh|(?:^|[\\/])notify\.(?:ps1|sh)).*(stop|notification|ApprovalRequest)\s+codex(?:\s|$)'
 }
 
 # Mirror of the bash is_notify_type_enabled: the alert types live in the
@@ -2428,6 +2429,65 @@ function Invoke-UsageCommand {
     }
 }
 
+function Invoke-AlertsCommand {
+    param([string]$Action = "status", [string]$Type)
+
+    $codexSetupUpdated = $false
+    $canonicalTypes = @("idle_prompt", "permission_prompt", "approval_request", "auth_success", "elicitation_dialog", "ask_user",
+        "SubagentStart", "SubagentStop", "TeammateIdle", "TaskCreated", "TaskCompleted")
+    $current = "idle_prompt"
+    if (Test-Path $script:NotifyTypesFile) {
+        $current = ([string](Get-Content $script:NotifyTypesFile -Raw)).Trim()
+    }
+    $types = @($current -split '\|' | Where-Object { $_ })
+    switch ($Action.ToLowerInvariant()) {
+        "add" {
+            $normalized = ($Type -replace '[-_]', '').ToLowerInvariant()
+            $canonical = $canonicalTypes | Where-Object { ($_ -replace '_', '').ToLowerInvariant() -eq $normalized } | Select-Object -First 1
+            if (-not $canonical) { throw "Unknown alert type: $Type" }
+            if ($canonical -eq "approval_request" -and (Test-NotificationsEnabled -Tool "codex")) {
+                $settings = Get-Content $script:CodexHooksFile -Raw | ConvertFrom-Json
+                $command = Get-CodexPermissionCommand -NotifyScript (Get-NotifyScript)
+                if (-not (Test-HookEntriesContainCommand -Entries @($settings.hooks.PermissionRequest) -Matcher "*" -Command $command)) {
+                    if (-not (Update-CodexHooksFile -Path $script:CodexHooksFile -NotifyScript (Get-NotifyScript))) {
+                        throw "Could not update Codex hooks"
+                    }
+                    $codexSetupUpdated = $true
+                    Write-Info "Updated Codex setup; start a fresh session to load the new hook"
+                }
+            }
+            if ($types -notcontains $canonical) { $types += $canonical }
+        }
+        "remove" {
+            $normalized = ($Type -replace '[-_]', '').ToLowerInvariant()
+            $canonical = $canonicalTypes | Where-Object { ($_ -replace '_', '').ToLowerInvariant() -eq $normalized } | Select-Object -First 1
+            if (-not $canonical) { throw "Unknown alert type: $Type" }
+            $types = @($types | Where-Object { $_ -ne $canonical })
+        }
+        "reset" { $types = @("idle_prompt") }
+        "status" {
+            Write-Host "Current alerts: $current"
+            Write-Host "approval_request: every Codex approval request, including Auto-review (opt-in)"
+            return
+        }
+        default {
+            Write-Host "Usage: cn alerts [add <type>|remove <type>|reset]"
+            Write-Host "Types: $($canonicalTypes -join ', ')"
+            return
+        }
+    }
+    New-Item -ItemType Directory -Path $script:NotificationsDir -Force | Out-Null
+    ($types -join '|') | Set-Content $script:NotifyTypesFile -Encoding ASCII
+    Write-Success "Alerts: $($types -join '|')"
+    if ($canonical -eq "approval_request" -or $Action -eq "reset") {
+        if (-not $codexSetupUpdated) {
+            Write-Info "Applies immediately to Codex; no hook reinstall needed"
+        }
+    } else {
+        Write-Info "Run 'cn on' to update other tools' hooks"
+    }
+}
+
 function Show-Help {
     Write-Host @"
 
@@ -2442,6 +2502,7 @@ COMMANDS:
     on [tool|all]   Enable notifications globally or for a specific tool
     off [tool|all]  Disable notifications globally or for a specific tool
     status [tool|all] Show notification status
+    alerts <cmd>    Configure which events trigger alerts
     test            Send a test notification
     update [check]  Update code-notify or check the latest release
     channels <cmd>  Configure Slack/Discord delivery
@@ -2455,6 +2516,13 @@ TOOLS:
     claude          Claude Code
     codex           OpenAI Codex CLI
     gemini          Google Gemini CLI
+
+CODEX ALERTS:
+    Native Windows supports Codex completion alerts. For human approval and
+    blocking question alerts, use 'cn codex' in WSL (Python 3 required).
+    cn alerts add approval_request opts into every Codex approval request,
+    including requests Auto-review resolves. cn alerts remove approval_request
+    disables these early alerts. Changes apply without reinstalling hooks.
 
 SOUND COMMANDS:
     sound on        Enable with default system sound
@@ -2646,6 +2714,7 @@ function Invoke-CodeNotify {
             }
         }
         "test" { Send-TestNotification }
+        "alerts" { Invoke-AlertsCommand -Action $(if ($SubCommand) { $SubCommand } else { "status" }) -Type ($Args | Select-Object -First 1) }
         "update" {
             if ($SubCommand -eq "check") {
                 Update-CodeNotify -Check
@@ -2853,23 +2922,13 @@ function Get-CodexHookType {
         return "stop"
     }
 
-    if ($payloadType -match 'request_permissions|permission|approval|elicitation|prompt') {
-        return "notification"
+    if (@("request_permissions", "approval_requested", "permission_prompt", "sandbox_approval") -contains $payloadType) {
+        return "ApprovalRequest"
     }
 
-    if ($payloadType -match 'error|failed') {
-        return "error"
-    }
-
-    if ($Payload -match 'last-assistant-message') {
-        return "stop"
-    }
-
-    if ($Payload -match 'request_permissions|approval|permission') {
-        return "notification"
-    }
-
-    return "stop"
+    # Codex notify= emits only completion. Internal approval requests and
+    # unknown payloads do not prove that Codex needs the user's attention.
+    return "ignore"
 }
 
 function Get-CodexProjectName {
@@ -2887,7 +2946,42 @@ if ($HookType -eq "codex") {
     $ToolName = "codex"
     $HookData = $ProjectName
     $HookType = Get-CodexHookType -Payload $HookData
+    if ($HookType -eq "ignore") { exit 0 }
     $ProjectName = Get-CodexProjectName -Payload $HookData
+}
+
+# Preserve the old dispatcher for the all-request opt-in.
+if ($ToolName -eq "codex" -and $HookType -eq "notification") {
+    if ((Get-JsonStringValue -Json $HookData -Key "hook_event_name") -eq "PermissionRequest") {
+        $HookType = "ApprovalRequest"
+    } else {
+        exit 0
+    }
+}
+
+# Early requests are a separate opt-in, never proof of a human wait. Read the
+# same flag file as the CLI before rate limits, state changes, or delivery.
+if ($HookType -eq "ApprovalRequest") {
+    if ($ToolName -ne "codex") { exit 0 }
+    $typesFile = Join-Path "$ClaudeHome\notifications" "notify-types"
+    if (-not (Test-Path $typesFile)) { exit 0 }
+    $types = (Get-Content $typesFile -Raw -ErrorAction SilentlyContinue)
+    if (-not $types -or (($types.Trim() -split '\|') -notcontains "approval_request")) { exit 0 }
+    # Honor cn off codex even if a running session still has the old hook.
+    $codexHooksFile = "$env:USERPROFILE\.codex\hooks.json"
+    try {
+        $codexHooks = Get-Content $codexHooksFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    } catch { exit 0 }
+    $hasManagedStop = $false
+    foreach ($entry in @($codexHooks.hooks.Stop)) {
+        foreach ($hook in @($entry.hooks)) {
+            if ($hook.type -eq "command" -and $hook.command -match '(code-notify.*notifier\.sh|(?:^|[\\/])notify\.(?:ps1|sh)).*stop\s+codex(?:\s|$)') {
+                $hasManagedStop = $true
+            }
+        }
+    }
+    if (-not $hasManagedStop) { exit 0 }
+    if (Test-Path (Join-Path "$ClaudeHome\notifications" "disabled")) { exit 0 }
 }
 
 # StopFailure fires when a turn ends on an API error instead of a Stop event.
@@ -3019,6 +3113,7 @@ function Get-PersistKey {
         "stop" { return "stop" }
         "notification" { return Get-NotificationSubtype }
         "pretooluse" { return "ask_user" }
+        "approvalrequest" { return "approval_request" }
     }
     if (@("SubagentStart", "SubagentStop", "TeammateIdle", "TaskCreated", "TaskCompleted") -contains $HookType) {
         return $HookType
@@ -3368,12 +3463,12 @@ function Test-ShouldSuppressNotification {
     }
 
     # Check for auto-accept environment variable (Issue #7)
-    if ($env:CLAUDE_AUTO_ACCEPT -eq "true") {
+    if ($HookType -ne "ApprovalRequest" -and $env:CLAUDE_AUTO_ACCEPT -eq "true") {
         return $true
     }
 
     # Check if hook data indicates auto-acceptance
-    if ($HookData -and $HookData -match '"autoAccepted"\s*:\s*true') {
+    if ($HookType -ne "ApprovalRequest" -and $HookData -and $HookData -match '"autoAccepted"\s*:\s*true') {
         return $true
     }
 
@@ -3389,7 +3484,7 @@ if (Test-ClaudeDelegatedWorkShouldSuppress) {
 }
 
 # Check if notification should be suppressed
-if ($HookType -eq "stop" -or $HookType -eq "notification" -or $HookType -eq "StopFailure") {
+if ($HookType -eq "stop" -or $HookType -eq "notification" -or $HookType -eq "StopFailure" -or $HookType -eq "ApprovalRequest") {
     if (Test-ShouldSuppressNotification) {
         exit 0  # Skip this notification
     }
@@ -3507,6 +3602,13 @@ switch ($HookType.ToLower()) {
             "Complete! $ToolDisplay finished in $ProjectName, so take a look whenever it suits you",
             "All wrapped up! $ToolDisplay finished in $ProjectName, so let me know what you think"
         )
+        $Message = Select-WordedMessage -Short $shortPool -Long $longPool -Style $BannerWording
+        $VoiceMessage = Select-WordedMessage -Short $shortPool -Long $longPool -Style $VoiceWording
+    }
+    "approvalrequest" {
+        $Title = "$ToolDisplay - Approval Requested"
+        $shortPool = @("$ToolDisplay requested tool approval in $ProjectName", "$ToolDisplay submitted an approval request in $ProjectName")
+        $longPool = @("$ToolDisplay submitted a tool approval request in $ProjectName; it may be resolved automatically")
         $Message = Select-WordedMessage -Short $shortPool -Long $longPool -Style $BannerWording
         $VoiceMessage = Select-WordedMessage -Short $shortPool -Long $longPool -Style $VoiceWording
     }
@@ -4002,6 +4104,7 @@ function Get-EventPoolSoundLocal {
             }
         }
         "PreToolUse" { @("question", "permission") }
+        "ApprovalRequest" { @("permission", "question") }
         "SubagentStart" { @("subagent-start", "SubagentStart", "notification", "idle") }
         "SubagentStop" { @("subagent-stop", "SubagentStop", "complete", "idle") }
         "TeammateIdle" { @("teammate-idle", "TeammateIdle", "idle") }

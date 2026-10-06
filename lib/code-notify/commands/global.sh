@@ -22,6 +22,13 @@ handle_global_command() {
     shift
     
     case "$command" in
+        "codex")
+            if ! command -v python3 >/dev/null 2>&1; then
+                error "cn codex requires Python 3"
+                return 1
+            fi
+            exec python3 "$GLOBAL_CMD_DIR/../hooks/codex/launcher.py" "$@"
+            ;;
         "on")
             enable_notifications_global "$@"
             ;;
@@ -658,9 +665,19 @@ show_status() {
             echo "     Idle reminder: tmux-only post-completion watch when idle_prompt is enabled"
             echo "     Codex TUI notifications: disabled to avoid duplicate toasts"
             if is_notify_type_enabled "permission_prompt"; then
-                echo "     Approval alerts: ENABLED via PermissionRequest hook"
+                echo "     Approval alerts: ENABLED when launched with 'cn codex'"
             else
-                echo "     Approval alerts: disabled (run 'cn alerts add permission_prompt && cn on codex')"
+                echo "     Approval alerts: disabled (run 'cn alerts add permission_prompt')"
+            fi
+            if is_notify_type_enabled "approval_request"; then
+                echo "     All approval requests: ENABLED, including Auto-review (also with plain 'codex')"
+            else
+                echo "     All approval requests: disabled (opt in with 'cn alerts add approval_request')"
+            fi
+            if is_notify_type_enabled "ask_user"; then
+                echo "     Question alerts: ENABLED when launched with 'cn codex'"
+            else
+                echo "     Question alerts: disabled (run 'cn alerts add ask_user')"
             fi
         else
             echo "  ${MUTE} Codex: ${DIM}DISABLED${RESET}"
@@ -1752,7 +1769,7 @@ show_alerts_status() {
     echo "  Matcher: ${CYAN}$current${RESET}"
     echo ""
 
-    echo "  Claude Notification subtypes:"
+    echo "  Notification alerts:"
     if is_notify_type_enabled "idle_prompt"; then
         echo "    ${CHECK_MARK} ${GREEN}idle_prompt${RESET} - Claude/Gemini idle prompt; tmux-only idle reminder for Codex/Antigravity/opencode"
     else
@@ -1771,6 +1788,12 @@ show_alerts_status() {
         echo "    ${MUTE} ${DIM}auth_success${RESET}"
     fi
 
+    if is_notify_type_enabled "approval_request"; then
+        echo "    ${CHECK_MARK} ${GREEN}approval_request${RESET} - Every Codex approval request, including Auto-review"
+    else
+        echo "    ${MUTE} ${DIM}approval_request${RESET} - Every Codex approval request (opt-in)"
+    fi
+
     if is_notify_type_enabled "elicitation_dialog"; then
         echo "    ${CHECK_MARK} ${GREEN}elicitation_dialog${RESET} - MCP tool input needed"
     else
@@ -1778,7 +1801,7 @@ show_alerts_status() {
     fi
 
     if is_notify_type_enabled "ask_user"; then
-        echo "    ${CHECK_MARK} ${GREEN}ask_user${RESET} - AI asks a question (immediate notification)"
+        echo "    ${CHECK_MARK} ${GREEN}ask_user${RESET} - Claude question; Codex blocking question (cn codex)"
     else
         echo "    ${MUTE} ${DIM}ask_user${RESET}"
     fi
@@ -1818,19 +1841,23 @@ show_alerts_status() {
     echo ""
     info "Examples:"
     echo "  ${CYAN}cn alerts add permission_prompt${RESET}   # Also notify on tool permission requests"
-    echo "  ${CYAN}cn alerts add ask_user${RESET}            # Notify immediately when Claude asks a question"
+    echo "  ${CYAN}cn alerts add ask_user${RESET}            # Notify on Claude questions / Codex blocking questions"
+    echo "  ${CYAN}cn alerts add approval_request${RESET}    # Every Codex approval request, including Auto-review"
     echo "  ${CYAN}cn alerts add SubagentStop${RESET}        # Notify when Claude subagents finish"
     echo "  ${CYAN}cn alerts add auth_success${RESET}        # Also notify on auth success"
     echo "  ${CYAN}cn alerts remove permission_prompt${RESET} # Stop permission notifications"
     echo "  ${CYAN}cn alerts reset${RESET}                   # Back to idle_prompt only"
     echo ""
-    dim "Alert-type matching applies to Claude Code, Codex PermissionRequest, Gemini CLI, Antigravity PreToolUse hooks, and opencode permission/question events."
+    dim "Alert-type matching applies to Claude Code, cn codex requests, Gemini CLI, Antigravity, and opencode."
     dim "Claude agent/team events are separate hooks and are opt-in."
-    dim "For Codex, permission_prompt controls approval/edit PermissionRequest hooks; idle_prompt only gates the tmux-derived post-completion reminder."
+    dim "With cn codex: permission_prompt = human approval, ask_user = blocking question."
+    dim "approval_request opts into early Codex requests, including Auto-review, with plain codex or cn codex."
+    dim "If both approval types are enabled, each stage can notify."
+    dim "Codex completion uses Stop; idle_prompt gates the tmux-derived post-completion reminder."
     dim "For Antigravity, permission_prompt controls the run_command approval banner (PreToolUse); it takes effect immediately, no reinstall."
     dim "For opencode, permission_prompt and elicitation_dialog gate approval and question alerts separately; idle_prompt gates the same tmux-derived reminder."
     echo ""
-    dim "After changing, run 'cn on' to apply the new settings (Antigravity alert changes apply immediately)."
+    dim "Codex, Antigravity and opencode alert changes apply immediately; other hooks may need 'cn on'."
 }
 
 # Show available alert types
@@ -1838,9 +1865,10 @@ show_available_alert_types() {
     echo "Available notification types:"
     echo "  ${CYAN}idle_prompt${RESET}        - Claude/Gemini idle prompt; tmux-only Codex/Antigravity/opencode idle reminder"
     echo "  ${CYAN}permission_prompt${RESET}  - AI needs tool permission (can be noisy)"
+    echo "  ${CYAN}approval_request${RESET}   - Every Codex approval request, including Auto-review (opt-in)"
     echo "  ${CYAN}auth_success${RESET}       - Authentication success"
     echo "  ${CYAN}elicitation_dialog${RESET} - MCP tool input needed"
-    echo "  ${CYAN}ask_user${RESET}           - AI asks a question (immediate PreToolUse notification)"
+    echo "  ${CYAN}ask_user${RESET}           - Claude question; Codex blocking question (cn codex)"
     echo ""
     echo "Claude agent/team hook events:"
     echo "  ${CYAN}SubagentStart${RESET}      - A Claude subagent started"
@@ -1854,7 +1882,7 @@ show_available_alert_types() {
 
 # Add an alert type
 add_alert_type() {
-    local type
+    local type codex_hooks_updated=0
     type="$(normalize_alert_type "$1" 2>/dev/null || true)"
 
     if [[ -z "$type" ]]; then
@@ -1862,6 +1890,15 @@ add_alert_type() {
         echo ""
         show_available_alert_types
         return 1
+    fi
+
+    # Upgrade an already-enabled install that predates the stable dispatcher.
+    # Current installs only change the flag file; disabled Codex stays disabled.
+    if [[ "$type" == "approval_request" ]] && is_codex_enabled &&
+        ! grep -Fq ' ApprovalRequest codex' "$CODEX_HOOKS_FILE"; then
+        update_codex_hooks_file "enable" "$CODEX_HOOKS_FILE" || return 1
+        codex_hooks_updated=1
+        info "Updated Codex setup; start a fresh session to load the new hook"
     fi
 
     if is_notify_type_enabled "$type"; then
@@ -1877,9 +1914,13 @@ add_alert_type() {
     fi
 
     success "Added: $type"
-    if [[ "$type" != "ask_user" ]]; then
+    if [[ "$type" == "approval_request" ]]; then
+        if [[ "$codex_hooks_updated" == "0" ]]; then
+            info "Applies immediately to Codex; no hook reinstall needed"
+        fi
+    elif [[ "$type" != "ask_user" ]]; then
         echo ""
-        info "Run ${CYAN}cn on${RESET} to apply changes"
+        info "Codex/Antigravity/opencode apply changes immediately; run ${CYAN}cn on${RESET} for other hooks"
     fi
 }
 
@@ -1908,9 +1949,11 @@ remove_alert_type() {
     fi
 
     success "Removed: $type"
-    if [[ "$type" != "ask_user" ]]; then
+    if [[ "$type" == "approval_request" ]]; then
+        info "Applies immediately to Codex; no hook reinstall needed"
+    elif [[ "$type" != "ask_user" ]]; then
         echo ""
-        info "Run ${CYAN}cn on${RESET} to apply changes"
+        info "Codex/Antigravity/opencode apply changes immediately; run ${CYAN}cn on${RESET} for other hooks"
     fi
 }
 
@@ -1919,7 +1962,7 @@ reset_alert_types() {
     reset_notify_types
     success "Reset to default: idle_prompt"
     echo ""
-    info "Run ${CYAN}cn on${RESET} to apply changes"
+    info "Codex/Antigravity/opencode apply changes immediately; run ${CYAN}cn on${RESET} for other hooks"
 }
 
 # Show alerts help
@@ -1939,6 +1982,8 @@ show_alerts_help() {
     echo "Examples:"
     echo "  cn alerts                        # Show current config"
     echo "  cn alerts add permission_prompt  # Also notify on permission requests"
+    echo "  cn alerts add ask_user           # Claude questions / Codex blocking questions"
+    echo "  cn alerts add approval_request   # Every Codex request, including Auto-review"
     echo "  cn alerts add SubagentStop       # Also notify when Claude subagents finish"
     echo "  cn alerts remove permission_prompt"
     echo "  cn alerts reset                  # Back to idle_prompt only"

@@ -29,6 +29,7 @@ ${BOLD}COMMANDS:${RESET}
     ${GREEN}status${RESET}          Show status for all tools
     ${GREEN}status${RESET} all      Show status for all tools (explicit alias)
     ${GREEN}test${RESET}            Send a test notification
+    ${GREEN}codex${RESET} [args]    Run Codex with human approval/question alerts (macOS/Linux)
     ${GREEN}update${RESET} [check]  Update code-notify or check the latest release
     ${GREEN}alerts${RESET} <cmd>    Configure which events trigger alerts
     ${GREEN}channels${RESET} <cmd>  Configure Slack/Discord/ntfy delivery
@@ -70,11 +71,15 @@ ${BOLD}ALERT TYPES:${RESET}
     ${GREEN}alerts reset${RESET}        Reset to default (idle_prompt only)
     ${GREEN}alerts persist${RESET} <cmd> Keep selected alerts visible until closed (or a timeout)
 
-    Notification types: ${CYAN}idle_prompt${RESET} (default), ${CYAN}permission_prompt${RESET}, ${CYAN}auth_success${RESET}, ${CYAN}elicitation_dialog${RESET}, ${CYAN}ask_user${RESET}
+    Notification types: ${CYAN}idle_prompt${RESET} (default), ${CYAN}permission_prompt${RESET}, ${CYAN}approval_request${RESET}, ${CYAN}auth_success${RESET}, ${CYAN}elicitation_dialog${RESET}, ${CYAN}ask_user${RESET}
     Claude events: ${CYAN}SubagentStart${RESET}, ${CYAN}SubagentStop${RESET}, ${CYAN}TeammateIdle${RESET}, ${CYAN}TaskCreated${RESET}, ${CYAN}TaskCompleted${RESET}
-    Note: alert-type matching applies to Claude Code, Codex PermissionRequest,
-          Gemini CLI, Antigravity PreToolUse hooks, and opencode
-          permission/question events. Codex has no native idle_prompt hook,
+    With cn codex: permission_prompt alerts when human approval is required;
+                   ask_user alerts for blocking questions.
+    approval_request opts into every Codex approval request, including Auto-review,
+    with plain codex or cn codex. Both approval types can notify if enabled.
+    Codex alert changes apply immediately, without reinstalling hooks.
+    Note: alert-type matching also applies to Claude Code, Gemini CLI,
+          Antigravity and opencode. Codex has no native idle_prompt hook,
           and neither do Antigravity or opencode; with idle_prompt enabled,
           tmux can still deliver a post-completion idle reminder for all three.
 
@@ -171,6 +176,7 @@ ${BOLD}EXAMPLES:${RESET}
     cn alerts               # Show alert type config
     cn alerts add permission_prompt  # Also notify on permission requests
     cn alerts add ask_user
+    cn alerts add approval_request   # Every Codex request, including Auto-review
     cn alerts add SubagentStop       # Also notify when Claude subagents finish
     cn alerts reset         # Back to idle_prompt only (less noisy)
     cn channels add slack https://hooks.slack.com/services/...

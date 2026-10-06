@@ -178,6 +178,14 @@ else
     test_fail "codex payload parsing failed"
 fi
 
+# Test 14a: the normal-terminal Codex launcher reports confirmed human requests
+test_start "Codex attention launcher"
+if PYTHONDONTWRITEBYTECODE=1 python3 tests/test-codex-launcher.py; then
+    test_pass
+else
+    test_fail "Codex attention launcher failed"
+fi
+
 # Test 14b: Antigravity (agy) event payloads map to the right notifications
 test_start "antigravity payload parsing"
 if run_test_script tests/test-antigravity-notify.sh; then
@@ -380,6 +388,13 @@ else
 fi
 
 # Windows wording command writes the state files the Windows notifier reads
+test_start "windows Codex approval request alerts"
+if run_test_script tests/test-windows-codex-alerts.sh; then
+    test_pass
+else
+    test_fail "windows Codex approval request alerts failed"
+fi
+
 test_start "windows wording styles"
 if run_test_script tests/test-windows-wording.sh; then
     test_pass

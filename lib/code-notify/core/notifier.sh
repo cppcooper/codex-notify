@@ -35,6 +35,21 @@ if [[ -z "${CODE_NOTIFY_OPENCODE_HOOK:-}" ]] &&
     exit 0
 fi
 
+# The optional early approval hook is always installed so alert changes work
+# in running sessions. Keep the default-off path to a file read and no child
+# processes: permission hooks run synchronously before Auto-review.
+if [[ "$RAW_ARG1" == "ApprovalRequest" ]]; then
+    [[ "$RAW_ARG2" == "codex" ]] || exit 0
+    EARLY_APPROVAL_TYPES=""
+    if [[ -f "$HOME/.claude/notifications/notify-types" ]]; then
+        IFS= read -r EARLY_APPROVAL_TYPES < "$HOME/.claude/notifications/notify-types" || true
+    fi
+    case "|$EARLY_APPROVAL_TYPES|" in
+        *'|approval_request|'*) ;;
+        *) exit 0 ;;
+    esac
+fi
+
 NOTIFIER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # UserPromptSubmit (any agent whose installer registered the hook — Claude,
@@ -234,30 +249,22 @@ print(value if isinstance(value, str) else "", end="")
 
 get_codex_hook_type() {
     local payload_type
-    payload_type=$(json_extract_string "$HOOK_DATA" "type" | tr '[:upper:]' '[:lower:]')
+    payload_type=$(json_extract_string "$HOOK_DATA" "type")
 
     case "$payload_type" in
         "agent-turn-complete")
             printf '%s\n' "stop"
             return 0
             ;;
-        *"request_permissions"*|*"permission"*|*"approval"*|*"elicitation"*|*"prompt"*)
-            printf '%s\n' "notification"
-            return 0
-            ;;
-        *"error"*|*"failed"*)
-            printf '%s\n' "error"
+        "request_permissions"|"approval_requested"|"permission_prompt"|"sandbox_approval")
+            printf '%s\n' "ApprovalRequest"
             return 0
             ;;
     esac
-
-    if [[ "$HOOK_DATA" == *"last-assistant-message"* ]]; then
-        printf '%s\n' "stop"
-    elif [[ "$HOOK_DATA" == *"request_permissions"* ]] || [[ "$HOOK_DATA" == *"approval"* ]] || [[ "$HOOK_DATA" == *"permission"* ]]; then
-        printf '%s\n' "notification"
-    else
-        printf '%s\n' "stop"
-    fi
+    # notify= currently emits only agent-turn-complete. Internal requests
+    # are not evidence of a user wait: hooks, policy or Auto-review can settle
+    # them. Unknown/malformed payloads must not become completion alerts either.
+    printf '%s\n' "ignore"
 }
 
 get_codex_project_name() {
@@ -924,6 +931,7 @@ if [[ "$RAW_ARG1" == "codex" ]]; then
     TOOL_NAME="codex"
     HOOK_DATA="$RAW_ARG2"
     HOOK_TYPE=$(get_codex_hook_type)
+    [[ "$HOOK_TYPE" != "ignore" ]] || exit 0
     PROJECT_NAME="${RAW_ARG3:-$(get_codex_project_name)}"
 elif [[ "$RAW_ARG1" == agy:* ]]; then
     # Antigravity CLI: "agy:<Event>" + payload on stdin.
@@ -1067,6 +1075,36 @@ else
     if [[ ! -t 0 ]]; then
         HOOK_DATA=$(cat 2>/dev/null || true)
     fi
+    if [[ "$TOOL_NAME" == "codex" && -z "$RAW_ARG3" ]]; then
+        PROJECT_NAME=$(get_codex_project_name)
+    fi
+fi
+
+# Recognize the previously installed early hook for the opt-in request alert.
+# Confirmed protocol requests keep their existing permission/question types.
+if [[ "$TOOL_NAME" == "codex" ]] && [[ "$HOOK_TYPE" == "notification" ]]; then
+    if [[ "${CODE_NOTIFY_CODEX_ATTENTION:-}" != "1" ]] &&
+        [[ "$(json_extract_string "$HOOK_DATA" "hook_event_name")" == "PermissionRequest" ]]; then
+        HOOK_TYPE="ApprovalRequest"
+    else
+        case "$(json_extract_string "$HOOK_DATA" "type")" in
+            permission_prompt|ask_user|elicitation_dialog)
+                [[ "${CODE_NOTIFY_CODEX_ATTENTION:-}" == "1" ]] || exit 0
+                # Honor `cn off codex` in a running launcher, using the existing
+                # per-tool enablement state rather than creating another one.
+                source "$NOTIFIER_DIR/config.sh"
+                is_codex_enabled || exit 0
+                ;;
+            idle_prompt) ;;
+            *) exit 0 ;;
+        esac
+    fi
+fi
+if [[ "$HOOK_TYPE" == "ApprovalRequest" ]]; then
+    [[ "$TOOL_NAME" == "codex" ]] || exit 0
+    source "$NOTIFIER_DIR/config.sh"
+    is_notify_type_enabled "approval_request" || exit 0
+    is_codex_enabled || exit 0
 fi
 
 # tmux helpers use this only to find the agent ancestor of a hook shell. It is
@@ -1473,7 +1511,7 @@ claude_event_alert_enabled() {
 
 # Whether a notification alert type is enabled, for agents whose hooks are
 # installed all-or-nothing and so cannot be gated at install time the way
-# Claude's and Codex's permission hooks are. Reads the same normalized,
+# Claude's permission hooks are. Reads the same normalized,
 # pipe-separated file config.sh writes; an absent file means the default
 # (idle_prompt only), matching config.sh's DEFAULT_NOTIFY_TYPE.
 notify_alert_type_enabled() {
@@ -1702,6 +1740,9 @@ PY
 is_codex_desktop_trigger() {
     [[ "$TOOL_NAME" != "codex" ]] && return 1
     [[ "${CODE_NOTIFY_SKIP_CODEX_DESKTOP_CHECK:-}" == "1" ]] && return 1
+    # This request reached the actual CLI connection, even if the thread was
+    # originally created in Desktop and later resumed in this terminal.
+    [[ "${CODE_NOTIFY_CODEX_ATTENTION:-}" == "1" && "$RAW_ARG1" == "notification" ]] && return 1
 
     local client
     client=$(json_extract_string "$HOOK_DATA" "client" | tr '[:upper:]' '[:lower:]')
@@ -1787,7 +1828,7 @@ should_suppress_notification() {
         return 0
     fi
 
-    if [[ -n "$HOOK_DATA" ]]; then
+    if [[ -n "$HOOK_DATA" && "$HOOK_TYPE" != "ApprovalRequest" ]]; then
         if echo "$HOOK_DATA" | grep -q '"autoAccepted":\s*true' 2>/dev/null; then
             return 0
         fi
@@ -1828,11 +1869,17 @@ if [[ "$HOOK_TYPE" == "notification" ]]; then
 fi
 
 # opencode's plugin is one file that reports every event, so there is no
-# install-time gate on it the way Claude and Codex only register their
+# install-time gate on it the way Claude only registers its
 # permission hooks while the alert type is on. Enforce the alert types here
 # instead — the same runtime gating Antigravity's approval banner uses, and
 # what lets `cn alerts add/remove` take effect with no reinstall.
-if [[ "$TOOL_NAME" == "opencode" ]] && [[ "$HOOK_TYPE" == "notification" ]]; then
+if [[ "$TOOL_NAME" == "codex" ]] && [[ "$HOOK_TYPE" == "notification" ]] &&
+    [[ "$(json_extract_string "$HOOK_DATA" "type")" == "ask_user" ]]; then
+    notify_alert_type_enabled "ask_user" || exit 0
+    # Reuse the existing question wording, 🙋 badge, sound and persistence key.
+    HOOK_TYPE="PreToolUse"
+fi
+if [[ "$TOOL_NAME" == "opencode" || "$TOOL_NAME" == "codex" ]] && [[ "$HOOK_TYPE" == "notification" ]]; then
     case "$NOTIFICATION_SUBTYPE" in
         "permission_prompt" | "elicitation_dialog")
             notify_alert_type_enabled "$NOTIFICATION_SUBTYPE" || exit 0
@@ -1935,6 +1982,9 @@ get_persist_key() {
         "PreToolUse")
             printf '%s\n' "ask_user"
             ;;
+        "ApprovalRequest")
+            printf '%s\n' "approval_request"
+            ;;
         "SubagentStart"|"SubagentStop"|"TeammateIdle"|"TaskCreated"|"TaskCompleted")
             printf '%s\n' "$HOOK_TYPE"
             ;;
@@ -2005,7 +2055,11 @@ case "$HOOK_TYPE" in
         # The managed Claude AskUserQuestion hook uses this event. Once its
         # answer is supplied, PostToolUse (or the following PreToolUse) resumes
         # the same turn without a UserPromptSubmit event.
-        tmux_running_pause_for_input 2>/dev/null || true
+        if [[ "$TOOL_NAME" == "codex" ]]; then
+            tmux_running_pause_for_input watch 2>/dev/null || true
+        else
+            tmux_running_pause_for_input 2>/dev/null || true
+        fi
         TMUX_BADGE_RUNNING_GUARD=1
         ;;
     "StopFailure")
@@ -2077,7 +2131,9 @@ fi
 # Check if notification should be suppressed. "error" is included so that the
 # kill switch (cn off) and snooze silence failure alerts too — they are still
 # notifications and must honour an explicit request for quiet.
-if [[ "$HOOK_TYPE" == "stop" ]] || [[ "$HOOK_TYPE" == "notification" ]] || [[ "$HOOK_TYPE" == "error" ]] || [[ "$HOOK_TYPE" == "StopFailure" ]] || [[ "$HOOK_TYPE" == "PreToolUse" ]] || is_claude_event_hook; then
+if [[ "$HOOK_TYPE" == "stop" ]] || [[ "$HOOK_TYPE" == "notification" ]] || [[ "$HOOK_TYPE" == "error" ]] ||
+    [[ "$HOOK_TYPE" == "StopFailure" ]] || [[ "$HOOK_TYPE" == "PreToolUse" ]] ||
+    [[ "$HOOK_TYPE" == "ApprovalRequest" ]] || is_claude_event_hook; then
     if should_suppress_notification; then
         # A stop silenced only by the rate limit still earns its tmux badge.
         # The limit exists to keep parallel sub-agents from spamming toasts, but
@@ -2254,6 +2310,18 @@ case "$HOOK_TYPE" in
                 "$TOOL_DISPLAY finished its turn. A teammate is still working in the background" \
                 "Heads up! $TOOL_DISPLAY is done for now, and a teammate is still busy"
         fi
+        ;;
+    "ApprovalRequest")
+        TITLE="$TOOL_DISPLAY 💬"
+        SUBTITLE="Approval Requested"
+        # An early request may be auto-resolved, so leave the running indicator
+        # and waiting badge alone. Only the confirmed request marks a wait.
+        set_event_messages \
+            "$TOOL_DISPLAY requested tool approval" \
+            "$TOOL_DISPLAY submitted an approval request" \
+            -- \
+            "$TOOL_DISPLAY submitted a tool approval request; it may be resolved automatically"
+        SOUND="Ping"
         ;;
     "notification")
         TITLE="$TOOL_DISPLAY 💬"

@@ -603,6 +603,7 @@ run_test_project_hooks_special_chars() {
 }
 
 run_test_codex_hook_config() {
+    local parser="${1:-jq}"
     local test_dir=$(mktemp -d)
     trap "rm -rf $test_dir" RETURN
 
@@ -612,6 +613,10 @@ run_test_codex_hook_config() {
 
     (
         source "$SCRIPT_DIR/../lib/code-notify/core/config.sh"
+
+        if [[ "$parser" == "python" ]]; then
+            has_jq() { return 1; }
+        fi
 
         echo ""
         echo "=== Testing Codex hook configuration ==="
@@ -714,7 +719,10 @@ resume_commands = [
     if hook.get("type") == "command"
 ]
 assert sum(command.endswith(" ResumeAfterInput codex") for command in resume_commands) == 1, resume_commands
-assert "PermissionRequest" not in hooks, hooks
+approval_entries = hooks.get("PermissionRequest", [])
+assert len(approval_entries) == 1, approval_entries
+assert approval_entries[0]["matcher"] == "*", approval_entries
+assert approval_entries[0]["hooks"][0]["command"].endswith(" ApprovalRequest codex"), approval_entries
 PY
             then
                 echo "❌ Codex hook config did not preserve expected state"
@@ -751,50 +759,49 @@ PY
         fi
         echo "✅ Re-enable repairs managed hooks without duplicates"
 
-        set_notify_types "permission_prompt"
-        if ! enable_codex_hooks; then
-            echo "❌ Failed to enable Codex permission hook"
-            exit 1
-        fi
+        # Runtime alert changes must not change hook enablement or require repair.
+        local original_hooks
+        original_hooks=$(cat "$CODEX_HOOKS_FILE")
+        for types in "permission_prompt" "approval_request" "ask_user|permission_prompt|approval_request" "idle_prompt"; do
+            set_notify_types "$types"
+            is_codex_enabled || { echo "❌ Alert settings changed Codex enablement"; exit 1; }
+            [[ "$(cat "$CODEX_HOOKS_FILE")" == "$original_hooks" ]] || exit 1
+            enable_codex_hooks || exit 1
+            [[ "$(cat "$CODEX_HOOKS_FILE")" == "$original_hooks" ]] || exit 1
+        done
+        echo "✅ Codex alert changes require no hook rewrite"
 
-        if ! grep -q '"PermissionRequest"' "$CODEX_HOOKS_FILE" || ! grep -q 'notification codex' "$CODEX_HOOKS_FILE"; then
-            echo "❌ permission_prompt did not install PermissionRequest hook"
-            cat "$CODEX_HOOKS_FILE"
-            exit 1
-        fi
-        echo "✅ permission_prompt installs PermissionRequest hook"
-
-        # The parser-free status fallback must retain the same conditional
-        # PermissionRequest requirement as the jq and Python implementations.
-        if command -v jq &> /dev/null; then
-            local missing_permission_hooks
-            missing_permission_hooks=$(mktemp)
-            jq 'del(.hooks.PermissionRequest)' "$CODEX_HOOKS_FILE" > "$missing_permission_hooks"
-            if (
-                has_jq() { return 1; }
-                has_python3() { return 1; }
-                has_current_codex_hooks "$missing_permission_hooks"
-            ); then
-                rm -f "$missing_permission_hooks"
-                echo "❌ parser-free Codex status accepted a missing PermissionRequest hook"
-                exit 1
-            fi
-            rm -f "$missing_permission_hooks"
-            echo "✅ parser-free Codex status requires PermissionRequest when enabled"
-        fi
-
-        set_notify_types "idle_prompt"
-        if ! enable_codex_hooks; then
-            echo "❌ Failed to remove Codex permission hook after alert reset"
-            exit 1
-        fi
-
-        if grep -q '"PermissionRequest"' "$CODEX_HOOKS_FILE"; then
-            echo "❌ PermissionRequest hook remained after permission_prompt was disabled"
-            cat "$CODEX_HOOKS_FILE"
-            exit 1
-        fi
-        echo "✅ disabling permission_prompt removes PermissionRequest hook"
+        # Migrate a mixed legacy entry, retaining the user's permission hook.
+        python3 - "$CODEX_HOOKS_FILE" "/old/code-notify/lib/code-notify/core/notifier.sh notification codex" <<'PYCODEX'
+import json, sys
+path, command = sys.argv[1:]
+with open(path) as f:
+    data = json.load(f)
+data["hooks"]["PermissionRequest"] = [{"matcher": "Bash", "hooks": [
+    {"type": "command", "command": command},
+    {"type": "command", "command": "user-approval-hook", "timeout": 123}
+]}]
+with open(path, "w") as f:
+    json.dump(data, f)
+PYCODEX
+        enable_codex_hooks || exit 1
+        python3 - "$CODEX_HOOKS_FILE" <<'PYCODEX'
+import json, sys
+with open(sys.argv[1]) as f:
+    hooks = json.load(f)["hooks"]["PermissionRequest"]
+assert hooks[0] == {"matcher": "Bash", "hooks": [
+    {"type": "command", "command": "user-approval-hook", "timeout": 123}
+]}, hooks
+assert len(hooks) == 2 and hooks[1]["matcher"] == "*", hooks
+assert hooks[1]["hooks"][0]["command"].endswith(" ApprovalRequest codex"), hooks
+PYCODEX
+        echo "✅ Legacy early approval hook migrated; user's mixed hook preserved"
+        (
+            has_jq() { return 1; }
+            has_python3() { return 1; }
+            has_current_codex_hooks "$CODEX_HOOKS_FILE"
+        ) || exit 1
+        echo "✅ Parser-free status uses stable lifecycle hooks"
 
         if ! disable_codex_hooks; then
             echo "❌ Failed to disable Codex hooks"
@@ -803,7 +810,7 @@ PY
 
         if grep -q ' stop codex' "$CODEX_HOOKS_FILE" || grep -q ' notification codex' "$CODEX_HOOKS_FILE" ||
             grep -q ' UserPromptSubmit codex' "$CODEX_HOOKS_FILE" || grep -q ' PostToolUse codex' "$CODEX_HOOKS_FILE" ||
-            grep -q ' ResumeAfterInput codex' "$CODEX_HOOKS_FILE"; then
+            grep -q ' ResumeAfterInput codex' "$CODEX_HOOKS_FILE" || grep -q ' ApprovalRequest codex' "$CODEX_HOOKS_FILE"; then
             echo "❌ disable_codex_hooks did not remove managed hooks"
             cat "$CODEX_HOOKS_FILE"
             exit 1
@@ -1443,6 +1450,7 @@ done
 
 # Test 8: Codex hook configuration and legacy notify cleanup
 run_test_codex_hook_config || fail "Codex hook configuration test failed"
+run_test_codex_hook_config "python" || fail "Codex Python hook configuration test failed"
 
 # Test 8b: Codex TUI notification value is preserved and restored
 run_test_codex_tui_preservation || fail "Codex TUI preservation test failed"

@@ -39,9 +39,10 @@ CLAUDE_EVENT_ALERT_TYPES="SubagentStart|SubagentStop|TeammateIdle|TaskCreated|Ta
 # Available notification types:
 # - idle_prompt: AI is waiting for user input (after 60+ seconds idle)
 # - permission_prompt: AI needs permission to use a tool
+# - approval_request: every Codex approval request, before Auto-review (opt-in)
 # - auth_success: Authentication success notifications
 # - elicitation_dialog: MCP tool input needed
-# - ask_user: AI is asking a question via AskUserQuestion (immediate PreToolUse notification)
+# - ask_user: Claude AskUserQuestion or a blocking Codex question (cn codex)
 # - SubagentStart/SubagentStop: Claude Code subagent lifecycle events
 # - TeammateIdle: Claude Code teammate waiting for input
 # - TaskCreated/TaskCompleted: Claude Code agent-team task lifecycle events
@@ -387,7 +388,7 @@ get_global_codex_stop_command() {
 }
 
 get_global_codex_permission_command() {
-    printf '%s notification codex\n' "$(get_notify_script)"
+    printf '%s ApprovalRequest codex\n' "$(get_notify_script)"
 }
 
 # Codex supports the UserPromptSubmit lifecycle hook (hooks.json, same event
@@ -444,7 +445,7 @@ get_managed_claude_stop_failure_pattern() {
 }
 
 get_managed_codex_hook_pattern() {
-    printf '%s\n' '(code-notify.*notifier\.sh|(?:^|[\\/])notify\.(?:ps1|sh)).*(stop|notification|UserPromptSubmit|PostToolUse|ResumeAfterInput)\s+codex(?:\s|$)'
+    printf '%s\n' '(code-notify.*notifier\.sh|(?:^|[\\/])notify\.(?:ps1|sh)).*(stop|notification|ApprovalRequest|UserPromptSubmit|PostToolUse|ResumeAfterInput)\s+codex(?:\s|$)'
 }
 
 has_claude_hooks_for_commands() {
@@ -2423,9 +2424,8 @@ remove_codex_tui_notifications_override() {
 
 has_current_codex_hooks() {
     local file="${1:-$CODEX_HOOKS_FILE}"
-    local stop_cmd permission_cmd prompt_cmd post_tool_cmd resume_cmd pattern
+    local stop_cmd prompt_cmd post_tool_cmd resume_cmd pattern
     stop_cmd="$(get_global_codex_stop_command)"
-    permission_cmd="$(get_global_codex_permission_command)"
     prompt_cmd="$(get_global_codex_prompt_command)"
     post_tool_cmd="$(get_global_codex_post_tool_command)"
     resume_cmd="$(get_global_codex_resume_after_input_command)"
@@ -2436,34 +2436,28 @@ has_current_codex_hooks() {
     if has_jq; then
         jq -e \
             --arg stop "$stop_cmd" \
-            --arg permission "$permission_cmd" \
             --arg prompt "$prompt_cmd" \
             --arg post_tool "$post_tool_cmd" \
             --arg resume "$resume_cmd" \
-            --arg pattern "$pattern" \
-            --argjson permission_enabled "$(is_notify_type_enabled "permission_prompt" && echo true || echo false)" '
+            --arg pattern "$pattern" '
             def command_matches($exact):
                 . == $exact or test($pattern);
 
             any((.hooks.Stop // [])[]?.hooks[]?.command?; command_matches($stop)) and
             any((.hooks.UserPromptSubmit // [])[]?.hooks[]?.command?; command_matches($prompt)) and
             any((.hooks.PostToolUse // [])[]?.hooks[]?.command?; command_matches($post_tool)) and
-            any((.hooks.PreToolUse // [])[]?.hooks[]?.command?; command_matches($resume)) and
-            (
-                ($permission_enabled | not) or
-                any((.hooks.PermissionRequest // [])[]?.hooks[]?.command?; command_matches($permission))
-            )
+            any((.hooks.PreToolUse // [])[]?.hooks[]?.command?; command_matches($resume))
         ' "$file" &>/dev/null
         return $?
     fi
 
     if has_python3; then
-        python3 - "$file" "$stop_cmd" "$permission_cmd" "$prompt_cmd" "$post_tool_cmd" "$resume_cmd" "$pattern" "$(is_notify_type_enabled "permission_prompt" && echo true || echo false)" << 'PYTHON' 2>/dev/null
+        python3 - "$file" "$stop_cmd" "$prompt_cmd" "$post_tool_cmd" "$resume_cmd" "$pattern" << 'PYTHON' 2>/dev/null
 import json
 import re
 import sys
 
-file_path, stop_cmd, permission_cmd, prompt_cmd, post_tool_cmd, resume_cmd, pattern, permission_enabled = sys.argv[1:9]
+file_path, stop_cmd, prompt_cmd, post_tool_cmd, resume_cmd, pattern = sys.argv[1:7]
 
 try:
     with open(file_path, "r", encoding="utf-8") as fh:
@@ -2500,8 +2494,6 @@ if not has_command("PostToolUse", post_tool_cmd):
     raise SystemExit(1)
 if not has_command("PreToolUse", resume_cmd):
     raise SystemExit(1)
-if permission_enabled == "true" and not has_command("PermissionRequest", permission_cmd):
-    raise SystemExit(1)
 PYTHON
         return $?
     fi
@@ -2513,25 +2505,19 @@ PYTHON
         grep -qE 'code-notify|notifier\.sh|notify\.(sh|ps1)' "$file" &&
         grep -q 'codex' "$file" || return 1
 
-    # Keep the parser-free fallback aligned with the jq/Python paths: an
-    # enabled permission_prompt alert requires a PermissionRequest hook.
-    if is_notify_type_enabled "permission_prompt"; then
-        grep -q '"PermissionRequest"' "$file" || return 1
-    fi
     return 0
 }
 
 update_codex_hooks_file() {
     local mode="$1"
     local file="$2"
-    local stop_cmd permission_cmd prompt_cmd post_tool_cmd resume_cmd pattern permission_enabled
+    local stop_cmd permission_cmd prompt_cmd post_tool_cmd resume_cmd pattern
     stop_cmd="$(get_global_codex_stop_command)"
     permission_cmd="$(get_global_codex_permission_command)"
     prompt_cmd="$(get_global_codex_prompt_command)"
     post_tool_cmd="$(get_global_codex_post_tool_command)"
     resume_cmd="$(get_global_codex_resume_after_input_command)"
     pattern="$(get_managed_codex_hook_pattern)"
-    permission_enabled="$(is_notify_type_enabled "permission_prompt" && echo true || echo false)"
 
     if has_jq; then
         safe_jq_update "$file" '
@@ -2584,6 +2570,15 @@ update_codex_hooks_file() {
                         "statusMessage": "Notifying task completion"
                     }]
                 }]) |
+                .hooks.PermissionRequest = ((.hooks.PermissionRequest // []) + [{
+                    "matcher": "*",
+                    "hooks": [{
+                        "type": "command",
+                        "command": $permission,
+                        "timeout": 5,
+                        "statusMessage": "Checking approval request alerts"
+                    }]
+                }]) |
                 .hooks.UserPromptSubmit = ((.hooks.UserPromptSubmit // []) + [{
                     "hooks": [{
                         "type": "command",
@@ -2609,20 +2604,7 @@ update_codex_hooks_file() {
                         "timeout": 5,
                         "statusMessage": "Restoring running indicator"
                     }]
-                }]) |
-                if $permission_enabled then
-                    .hooks.PermissionRequest = ((.hooks.PermissionRequest // []) + [{
-                        "matcher": "*",
-                        "hooks": [{
-                            "type": "command",
-                            "command": $permission,
-                            "timeout": 5,
-                            "statusMessage": "Notifying approval request"
-                        }]
-                    }])
-                else
-                    .
-                end
+                }])
             else
                 .
             end |
@@ -2633,21 +2615,20 @@ update_codex_hooks_file() {
           --arg prompt "$prompt_cmd" \
           --arg post_tool "$post_tool_cmd" \
           --arg resume "$resume_cmd" \
-          --arg pattern "$pattern" \
-          --argjson permission_enabled "$permission_enabled"
+          --arg pattern "$pattern"
         return $?
     fi
 
     if has_python3; then
         local tmp_json
         tmp_json=$(mktemp "$(dirname "$file")/.tmp.XXXXXX") || return 1
-        python3 - "$file" "$mode" "$stop_cmd" "$permission_cmd" "$prompt_cmd" "$post_tool_cmd" "$resume_cmd" "$pattern" "$permission_enabled" "$tmp_json" << 'PYTHON' || {
+        python3 - "$file" "$mode" "$stop_cmd" "$permission_cmd" "$prompt_cmd" "$post_tool_cmd" "$resume_cmd" "$pattern" "$tmp_json" << 'PYTHON' || {
 import json
 import os
 import re
 import sys
 
-file_path, mode, stop_cmd, permission_cmd, prompt_cmd, post_tool_cmd, resume_cmd, pattern, permission_enabled, tmp_path = sys.argv[1:11]
+file_path, mode, stop_cmd, permission_cmd, prompt_cmd, post_tool_cmd, resume_cmd, pattern, tmp_path = sys.argv[1:10]
 
 try:
     with open(file_path, "r", encoding="utf-8") as fh:
@@ -2730,6 +2711,15 @@ if mode == "enable":
             "statusMessage": "Notifying task completion",
         }],
     }]
+    hooks["PermissionRequest"] = list(hooks.get("PermissionRequest", [])) + [{
+        "matcher": "*",
+        "hooks": [{
+            "type": "command",
+            "command": permission_cmd,
+            "timeout": 5,
+            "statusMessage": "Checking approval request alerts",
+        }],
+    }]
     hooks["UserPromptSubmit"] = list(hooks.get("UserPromptSubmit", [])) + [{
         "hooks": [{
             "type": "command",
@@ -2756,16 +2746,6 @@ if mode == "enable":
             "statusMessage": "Restoring running indicator",
         }],
     }]
-    if permission_enabled == "true":
-        hooks["PermissionRequest"] = list(hooks.get("PermissionRequest", [])) + [{
-            "matcher": "*",
-            "hooks": [{
-                "type": "command",
-                "command": permission_cmd,
-                "timeout": 5,
-                "statusMessage": "Notifying approval request",
-            }],
-        }]
 
 if hooks:
     data["hooks"] = hooks
@@ -3588,7 +3568,7 @@ normalize_alert_type() {
     key="$(printf '%s' "$type" | tr '[:upper:]-' '[:lower:]_')"
 
     case "$key" in
-        "idle_prompt"|"permission_prompt"|"auth_success"|"elicitation_dialog"|"ask_user")
+        "idle_prompt"|"permission_prompt"|"approval_request"|"auth_success"|"elicitation_dialog"|"ask_user")
             printf '%s\n' "$key"
             ;;
         "subagentstart"|"subagent_start")

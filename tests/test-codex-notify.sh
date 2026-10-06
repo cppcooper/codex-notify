@@ -89,6 +89,8 @@ test_dir="$(mktemp -d)"
 trap 'rm -rf "$test_dir"' EXIT
 
 export HOME="$test_dir/home"
+export CODEX_HOME="$HOME/.codex"
+export CODE_NOTIFY_TAIL_SYNC=1
 fake_bin="$test_dir/bin"
 log_dir="$test_dir/log"
 sound_file="$test_dir/custom.aiff"
@@ -133,6 +135,16 @@ esac
 chmod +x "$fake_bin"/*
 
 fake_path="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin"
+(
+    source "$SCRIPT_DIR/../lib/code-notify/core/config.sh"
+    enable_codex_hooks
+)
+run_attention_notifier() {
+    printf '%s' "$1" | PATH="$fake_path" CODE_NOTIFY_CODEX_ATTENTION=1 bash "$NOTIFIER" notification codex
+}
+set_alerts() {
+    printf '%s\n' "$1" > "$HOME/.claude/notifications/notify-types"
+}
 
 run_codex_notifier "$fake_path" '{"type":"agent-turn-complete","cwd":"/tmp/demo","client":"codex-exec","input-messages":["Run tests"],"last-assistant-message":"All tests passed"}'
 run_codex_notifier "$fake_path" '{"type":"request_permissions","cwd":"/tmp/demo","tool":"exec_command"}'
@@ -146,14 +158,165 @@ run_codex_notifier "$fake_path" '{"type":"agent-turn-complete","thread-id":"desk
 write_codex_thread_metadata "cli-thread" "Codex CLI" "shell"
 run_codex_notifier "$fake_path" '{"type":"agent-turn-complete","thread-id":"cli-thread","cwd":"/tmp/demo","client":"codex-exec","last-assistant-message":"CLI event still notifies"}'
 
-wait_for_lines "$notification_log" 5 || fail "expected five Codex notification deliveries"
-wait_for_lines "$sound_log" 5 || fail "expected five Codex sound playbacks"
-wait_for_lines "$HOME/.claude/logs/notifications.log" 5 || fail "expected five Codex notification log entries"
+run_codex_notifier "$fake_path" '{"last-assistant-message":"No completion type"}'
+run_codex_notifier "$fake_path" '{"type":"error","last-assistant-message":"permission requested"}'
+run_codex_notifier "$fake_path" 'malformed'
+printf '%s' '{"hook_event_name":"PermissionRequest","type":"permission_prompt"}' | PATH="$fake_path" bash "$NOTIFIER" notification codex
 
-grep -q "Task Complete - demo" "$notification_log" || fail "Codex completion payload did not map to a stop notification"
-grep -q "Input Required - demo" "$notification_log" || fail "Codex permission-like payload did not map to an input-required notification"
-[[ $(wc -l < "$notification_log") -eq 5 ]] || fail "desktop-origin Codex events were not suppressed correctly"
-[[ $(wc -l < "$sound_log") -eq 5 ]] || fail "desktop-origin Codex sound playback was not suppressed correctly"
-[[ $(wc -l < "$HOME/.claude/logs/notifications.log") -eq 5 ]] || fail "desktop-origin Codex log entries were not suppressed correctly"
+[[ $(wc -l < "$notification_log") -eq 2 ]] || fail "unknown, early approval or desktop events notified"
+pass "Only explicit Codex completion events notify; early approvals stay silent"
 
-pass "Codex notifies for CLI sessions and repeated approval events while suppressing desktop-origin duplicates"
+run_attention_notifier '{"type":"permission_prompt","cwd":"/tmp/demo"}'
+[[ $(wc -l < "$notification_log") -eq 2 ]] || fail "approval alerted while disabled"
+set_alerts "permission_prompt"
+run_attention_notifier '{"type":"permission_prompt","cwd":"/tmp/demo"}'
+run_attention_notifier '{"type":"permission_prompt","cwd":"/tmp/demo"}'
+[[ $(wc -l < "$notification_log") -eq 4 ]] || fail "repeated human approvals were rate-limited"
+set_alerts "idle_prompt"
+run_attention_notifier '{"type":"permission_prompt","cwd":"/tmp/demo"}'
+run_attention_notifier '{"type":"ask_user","cwd":"/tmp/demo","tool_input":{"questions":[{"question":"Which option?"}]}}'
+[[ $(wc -l < "$notification_log") -eq 4 ]] || fail "removed approval or disabled question alerted"
+set_alerts "ask_user"
+run_attention_notifier '{"type":"ask_user","cwd":"/tmp/demo","tool_input":{"questions":[{"question":"Which option?"}]}}'
+run_attention_notifier '{"type":"ask_user","cwd":"/tmp/demo","tool_input":{"questions":[{"question":"Which option?"}]}}'
+wait_for_lines "$sound_log" 6 || fail "expected shared sound delivery for all six alerts"
+[[ $(wc -l < "$notification_log") -eq 6 ]] || fail "blocking questions were rate-limited"
+grep -q "Task Complete - demo" "$notification_log" || fail "completion UX changed"
+grep -q "Input Required - demo" "$notification_log" || fail "approval UX changed"
+grep -q "Question" "$notification_log" || fail "question UX not reused"
+grep -q "Which option?" "$notification_log" || fail "question text was lost"
+
+set_alerts "permission_prompt|ask_user"
+run_attention_notifier '{"type":"permission_prompt","thread-id":"desktop-thread","client":"codex-cli","cwd":"/tmp/demo"}'
+[[ $(wc -l < "$notification_log") -eq 7 ]] || fail "CLI request from a Desktop-created thread was suppressed"
+: > "$HOME/.claude/notifications/disabled"
+run_attention_notifier '{"type":"permission_prompt","cwd":"/tmp/demo"}'
+run_attention_notifier '{"type":"ask_user","cwd":"/tmp/demo","tool_input":{"questions":[{"question":"Which option?"}]}}'
+[[ $(wc -l < "$notification_log") -eq 7 ]] || fail "global kill switch ignored"
+rm "$HOME/.claude/notifications/disabled"
+(
+    source "$SCRIPT_DIR/../lib/code-notify/core/config.sh"
+    disable_codex_hooks
+)
+run_attention_notifier '{"type":"permission_prompt","cwd":"/tmp/demo"}'
+[[ $(wc -l < "$notification_log") -eq 7 ]] || fail "cn off codex ignored"
+pass "Confirmed requests reuse question/approval delivery and honor live alert settings and disablement"
+
+(
+    source "$SCRIPT_DIR/../lib/code-notify/core/config.sh"
+    enable_codex_hooks
+)
+printf '%s' '{"hook_event_name":"Stop","cwd":"/tmp/native-project","last_assistant_message":"Approval work is finished"}' | \
+    PATH="$fake_path" CODE_NOTIFY_STOP_RATE_LIMIT_SECONDS=0 bash "$NOTIFIER" stop codex
+[[ $(wc -l < "$notification_log") -eq 8 ]] || fail "native Stop hook did not deliver completion"
+grep -q "Task Complete - native-project" "$notification_log" || fail "native completion lost its project context"
+pass "Native Codex Stop hooks retain completion and project context"
+
+run_alerts_command() {
+    PATH="$fake_path" CODE_NOTIFY_COMMAND_NAME=cn bash "$SCRIPT_DIR/../bin/code-notify" alerts "$@" > /dev/null
+}
+run_approval_request() {
+    printf '%s' "$1" | PATH="$fake_path" bash "$NOTIFIER" ApprovalRequest codex
+}
+
+original_hooks=$(cat "$CODEX_HOME/hooks.json")
+printf '%s' "$original_hooks" > "$test_dir/original-hooks.json"
+original_config=$(cat "$CODEX_HOME/config.toml")
+# Simulate upgrading a working install without the new dispatcher. The normal
+# alert command must repair it, retaining the user's TOML and existing hooks.
+python3 - "$CODEX_HOME/hooks.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    data = json.load(f)
+data['hooks'].pop('PermissionRequest')
+with open(path, 'w') as f:
+    json.dump(data, f)
+PY
+run_alerts_command add approval-request
+python3 - "$test_dir/original-hooks.json" "$CODEX_HOME/hooks.json" <<'PY'
+import json, os, sys
+def normalized(path):
+    with open(path) as f:
+        data = json.load(f)
+    for entries in data['hooks'].values():
+        for entry in entries:
+            for hook in entry['hooks']:
+                path, event, tool = hook['command'].rsplit(' ', 2)
+                hook['command'] = ' '.join([os.path.normpath(path), event, tool])
+    return data
+assert normalized(sys.argv[1]) == normalized(sys.argv[2]), 'missing dispatcher was not restored'
+PY
+original_hooks=$(cat "$CODEX_HOME/hooks.json")
+[[ "$(cat "$CODEX_HOME/config.toml")" == "$original_config" ]] || fail "alert upgrade changed unrelated TOML"
+grep -q 'approval_request' "$HOME/.claude/notifications/notify-types" || fail "approval-request alias was not normalized"
+
+run_approval_request '{"hook_event_name":"PermissionRequest","cwd":"/tmp/demo","autoAccepted":true}'
+run_approval_request '{"hook_event_name":"PermissionRequest","cwd":"/tmp/demo"}'
+printf '%s' '{"hook_event_name":"PermissionRequest","cwd":"/tmp/demo"}' | PATH="$fake_path" bash "$NOTIFIER" notification codex
+run_codex_notifier "$fake_path" '{"type":"approval_requested","cwd":"/tmp/demo","autoAccepted":true}'
+run_codex_notifier "$fake_path" '{"type":"unknown","cwd":"/tmp/demo"}'
+[[ $(wc -l < "$notification_log") -eq 12 ]] || fail "all-request opt-in omitted an early/auto-accepted request or rate-limited it"
+grep -q "Approval Requested - demo" "$notification_log" || fail "early approval alert was not labeled distinctly"
+pass "All-request opt-in reports early and automatically resolved approvals, including legacy dispatchers"
+
+run_alerts_command remove permission_prompt
+run_attention_notifier '{"type":"permission_prompt","cwd":"/tmp/demo"}'
+[[ $(wc -l < "$notification_log") -eq 12 ]] || fail "early opt-in implicitly enabled human-wait alerts"
+run_alerts_command add permission_prompt
+run_attention_notifier '{"type":"permission_prompt","cwd":"/tmp/demo"}'
+[[ $(wc -l < "$notification_log") -eq 13 ]] || fail "early alerts suppressed a confirmed human wait"
+run_alerts_command remove approval_request
+run_approval_request '{"hook_event_name":"PermissionRequest","cwd":"/tmp/demo"}'
+printf '%s' '{"hook_event_name":"PermissionRequest","cwd":"/tmp/demo"}' | PATH="$fake_path" bash "$NOTIFIER" notification codex
+run_codex_notifier "$fake_path" '{"type":"request_permissions","cwd":"/tmp/demo"}'
+[[ $(wc -l < "$notification_log") -eq 13 ]] || fail "removing the opt-in did not immediately silence early requests"
+run_attention_notifier '{"type":"permission_prompt","cwd":"/tmp/demo"}'
+[[ $(wc -l < "$notification_log") -eq 14 ]] || fail "removing the early opt-in disabled confirmed waits"
+[[ "$(cat "$CODEX_HOME/hooks.json")" == "$original_hooks" ]] || fail "alert toggles rewrote installed hooks"
+[[ "$(cat "$CODEX_HOME/config.toml")" == "$original_config" ]] || fail "alert toggles rewrote unrelated TOML"
+pass "Both approval alert types are independent; live toggles preserve installed hooks and unrelated settings"
+
+run_alerts_command add approval_request
+: > "$HOME/.claude/notifications/disabled"
+run_approval_request '{"hook_event_name":"PermissionRequest","cwd":"/tmp/demo"}'
+rm "$HOME/.claude/notifications/disabled"
+printf '%s\n' "$(( $(date +%s) + 60 ))" > "$HOME/.claude/notifications/snooze-until"
+run_approval_request '{"hook_event_name":"PermissionRequest","cwd":"/tmp/demo"}'
+rm "$HOME/.claude/notifications/snooze-until"
+[[ $(wc -l < "$notification_log") -eq 14 ]] || fail "early requests ignored global disablement or snooze"
+
+run_alerts_command persist add approval-request
+run_approval_request '{"hook_event_name":"PermissionRequest","cwd":"/tmp/demo"}'
+[[ $(wc -l < "$notification_log") -eq 15 ]] || fail "persistent approval-request alert was lost"
+if [[ "$(uname -s)" == "Linux" ]]; then
+    tail -n 1 "$notification_log" | grep -q -- '--urgency=critical' || fail "early opt-in did not reuse persistence"
+fi
+(
+    source "$SCRIPT_DIR/../lib/code-notify/utils/sound.sh"
+    [[ "$(sound_event_candidates ApprovalRequest)" == "permission question" ]]
+) || fail "early approval did not reuse permission sounds"
+wait_for_lines "$sound_log" 15 || fail "early requests did not reuse shared sound delivery"
+run_alerts_command reset
+[[ "$(cat "$HOME/.claude/notifications/notify-types")" == "idle_prompt" ]] || fail "reset did not remove the opt-in"
+run_approval_request '{"hook_event_name":"PermissionRequest","cwd":"/tmp/demo"}'
+run_attention_notifier '{"type":"permission_prompt","cwd":"/tmp/demo"}'
+[[ $(wc -l < "$notification_log") -eq 15 ]] || fail "reset did not silence both approval types"
+
+# With the opt-in off, no utility sourcing, JSON parser, or other external
+# command should be needed by the synchronous PermissionRequest hook.
+fast_output=$(PATH="$test_dir/no-commands" "$BASH" "$NOTIFIER" ApprovalRequest codex 2>&1)
+[[ -z "$fast_output" ]] || fail "disabled early hook attempted to run external commands"
+pass "Early alerts reuse sound, persistence and snooze; reset restores the lightweight disabled path"
+
+(
+    source "$SCRIPT_DIR/../lib/code-notify/core/config.sh"
+    disable_codex_hooks
+)
+run_alerts_command add approval_request
+run_approval_request '{"hook_event_name":"PermissionRequest","cwd":"/tmp/demo"}'
+[[ $(wc -l < "$notification_log") -eq 15 ]] || fail "all-request setting bypassed cn off codex"
+if grep -q 'ApprovalRequest codex' "$CODEX_HOME/hooks.json"; then
+    fail "changing alerts re-enabled disabled Codex hooks"
+fi
+pass "The opt-in honors cn off codex and does not enable disabled tool hooks"
