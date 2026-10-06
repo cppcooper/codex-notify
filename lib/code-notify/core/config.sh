@@ -42,7 +42,7 @@ CLAUDE_EVENT_ALERT_TYPES="SubagentStart|SubagentStop|TeammateIdle|TaskCreated|Ta
 # - approval_request: every Codex approval request, before Auto-review (opt-in)
 # - auth_success: Authentication success notifications
 # - elicitation_dialog: MCP tool input needed
-# - ask_user: Claude AskUserQuestion or a blocking Codex question (cn codex)
+# - ask_user: Claude/Codex question; blocking Codex questions use cn codex
 # - SubagentStart/SubagentStop: Claude Code subagent lifecycle events
 # - TeammateIdle: Claude Code teammate waiting for input
 # - TaskCreated/TaskCompleted: Claude Code agent-team task lifecycle events

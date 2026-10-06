@@ -675,7 +675,7 @@ show_status() {
                 echo "     All approval requests: disabled (opt in with 'cn alerts add approval_request')"
             fi
             if is_notify_type_enabled "ask_user"; then
-                echo "     Question alerts: ENABLED when launched with 'cn codex'"
+                echo "     Question alerts: ENABLED for normal-mode prompts; blocking prompts with 'cn codex'"
             else
                 echo "     Question alerts: disabled (run 'cn alerts add ask_user')"
             fi
@@ -1770,6 +1770,7 @@ show_alerts_status() {
     echo ""
 
     echo "  Notification alerts:"
+    echo "    ${CHECK_MARK} ${GREEN}stop${RESET} - Task complete (enabled when tool notifications are on)"
     if is_notify_type_enabled "idle_prompt"; then
         echo "    ${CHECK_MARK} ${GREEN}idle_prompt${RESET} - Claude/Gemini idle prompt; tmux-only idle reminder for Codex/Antigravity/opencode"
     else
@@ -1801,7 +1802,7 @@ show_alerts_status() {
     fi
 
     if is_notify_type_enabled "ask_user"; then
-        echo "    ${CHECK_MARK} ${GREEN}ask_user${RESET} - Claude question; Codex blocking question (cn codex)"
+        echo "    ${CHECK_MARK} ${GREEN}ask_user${RESET} - Claude/Codex questions; blocking Codex questions with cn codex"
     else
         echo "    ${MUTE} ${DIM}ask_user${RESET}"
     fi
@@ -1841,16 +1842,18 @@ show_alerts_status() {
     echo ""
     info "Examples:"
     echo "  ${CYAN}cn alerts add permission_prompt${RESET}   # Also notify on tool permission requests"
-    echo "  ${CYAN}cn alerts add ask_user${RESET}            # Notify on Claude questions / Codex blocking questions"
+    echo "  ${CYAN}cn alerts add ask_user${RESET}            # Notify on Claude/Codex questions"
     echo "  ${CYAN}cn alerts add approval_request${RESET}    # Every Codex approval request, including Auto-review"
     echo "  ${CYAN}cn alerts add SubagentStop${RESET}        # Notify when Claude subagents finish"
     echo "  ${CYAN}cn alerts add auth_success${RESET}        # Also notify on auth success"
     echo "  ${CYAN}cn alerts remove permission_prompt${RESET} # Stop permission notifications"
     echo "  ${CYAN}cn alerts reset${RESET}                   # Back to idle_prompt only"
+    echo "  ${CYAN}cn alerts persist add stop${RESET}        # Keep task-complete alerts on screen"
     echo ""
     dim "Alert-type matching applies to Claude Code, cn codex requests, Gemini CLI, Antigravity, and opencode."
     dim "Claude agent/team events are separate hooks and are opt-in."
-    dim "With cn codex: permission_prompt = human approval, ask_user = blocking question."
+    dim "Codex ask_user alerts when normal-mode questions are displayed, even while Codex works."
+    dim "With cn codex: permission_prompt = human approval, ask_user also covers blocking questions."
     dim "approval_request opts into early Codex requests, including Auto-review, with plain codex or cn codex."
     dim "If both approval types are enabled, each stage can notify."
     dim "Codex completion uses Stop; idle_prompt gates the tmux-derived post-completion reminder."
@@ -1868,7 +1871,7 @@ show_available_alert_types() {
     echo "  ${CYAN}approval_request${RESET}   - Every Codex approval request, including Auto-review (opt-in)"
     echo "  ${CYAN}auth_success${RESET}       - Authentication success"
     echo "  ${CYAN}elicitation_dialog${RESET} - MCP tool input needed"
-    echo "  ${CYAN}ask_user${RESET}           - Claude question; Codex blocking question (cn codex)"
+    echo "  ${CYAN}ask_user${RESET}           - Claude/Codex questions; blocking Codex questions with cn codex"
     echo ""
     echo "Claude agent/team hook events:"
     echo "  ${CYAN}SubagentStart${RESET}      - A Claude subagent started"
@@ -1982,7 +1985,7 @@ show_alerts_help() {
     echo "Examples:"
     echo "  cn alerts                        # Show current config"
     echo "  cn alerts add permission_prompt  # Also notify on permission requests"
-    echo "  cn alerts add ask_user           # Claude questions / Codex blocking questions"
+    echo "  cn alerts add ask_user           # Claude/Codex questions"
     echo "  cn alerts add approval_request   # Every Codex request, including Auto-review"
     echo "  cn alerts add SubagentStop       # Also notify when Claude subagents finish"
     echo "  cn alerts remove permission_prompt"

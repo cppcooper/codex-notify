@@ -50,6 +50,83 @@ if [[ "$RAW_ARG1" == "ApprovalRequest" ]]; then
     esac
 fi
 
+# Normal-mode questions return immediately after Codex displays them. The
+# existing PostToolUse hook confirms acceptance; alert only after that result,
+# rather than guessing from a tool invocation or an internal lifecycle event.
+get_codex_async_question_payload() {
+    if command -v jq >/dev/null 2>&1; then
+        jq -ce '
+            select(.tool_name == "request_user_input_async" or .tool_name == "functions.request_user_input_async")
+            | . as $hook
+            | (.tool_response | if type == "string" then fromjson else . end) as $response
+            | select($response.accepted == true)
+            | .tool_input.questions as $questions
+            | select($questions | type == "array" and length > 0)
+            | select(all($questions[]; .title | type == "string" and length > 0))
+            | {type: "ask_user", cwd: $hook.cwd, "thread-id": $hook.session_id,
+               tool_input: {questions: ($questions | map(. + {question: .title}))}}
+        ' 2>/dev/null
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import json, sys
+try:
+    hook = json.load(sys.stdin)
+    if hook.get("tool_name") not in ("request_user_input_async", "functions.request_user_input_async"):
+        raise ValueError()
+    response = hook.get("tool_response")
+    if isinstance(response, str):
+        response = json.loads(response)
+    if not isinstance(response, dict) or response.get("accepted") is not True:
+        raise ValueError()
+    questions = hook.get("tool_input", {}).get("questions")
+    if not isinstance(questions, list) or not questions or not all(
+        isinstance(q, dict) and isinstance(q.get("title"), str) and q["title"] for q in questions
+    ):
+        raise ValueError()
+    print(json.dumps({"type": "ask_user", "cwd": hook.get("cwd"), "thread-id": hook.get("session_id"),
+                     "tool_input": {"questions": [dict(q, question=q["title"]) for q in questions]}}))
+except (ValueError, TypeError, AttributeError):
+    sys.exit(1)
+' 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+read_codex_async_question_candidate() {
+    # Bulk input avoids Bash read's byte-at-a-time cost on large tool results.
+    # The token check is ASCII; keep this locale local so question text and
+    # JSON parsing retain the user's encoding.
+    local LC_ALL=C
+    CODEX_POST_TOOL_DATA=$(cat 2>/dev/null) || return 1
+    case "$CODEX_POST_TOOL_DATA" in
+        *'"request_user_input_async"'*|*'"functions.request_user_input_async"'*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+CODEX_ASYNC_QUESTION_PAYLOAD=""
+if [[ "${CLAUDE_HOOK_TYPE:-$RAW_ARG1}" == "PostToolUse" && "$RAW_ARG2" == "codex" ]]; then
+    # Ordinary calls retain the resume path without loading utilities or a
+    # JSON parser. Disabled ask_user never reads the tool payload.
+    CODEX_QUESTION_TYPES=""
+    if [[ -f "$HOME/.claude/notifications/notify-types" ]]; then
+        IFS= read -r CODEX_QUESTION_TYPES < "$HOME/.claude/notifications/notify-types" || true
+    fi
+    case "|$CODEX_QUESTION_TYPES|" in
+        *'|ask_user|'*)
+            if read_codex_async_question_candidate; then
+                CODEX_ASYNC_QUESTION_PAYLOAD=$(printf '%s' "$CODEX_POST_TOOL_DATA" | get_codex_async_question_payload) || true
+            fi
+            ;;
+    esac
+    if [[ -n "$CODEX_ASYNC_QUESTION_PAYLOAD" ]]; then
+        RAW_ARG1="notification"
+        CODE_NOTIFY_CODEX_ATTENTION=1
+        CODEX_ASYNC_QUESTION=1
+    fi
+fi
+
 NOTIFIER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # UserPromptSubmit (any agent whose installer registered the hook — Claude,
@@ -80,7 +157,7 @@ fi
 # tmux_running_resume_after_input itself is gated by a marker set only when the
 # notifier observed an input/approval request, making ordinary tool hooks
 # no-ops.
-if [[ "$RAW_ARG1" != agy:* ]] && {
+if [[ "$RAW_ARG1" != agy:* && -z "$CODEX_ASYNC_QUESTION_PAYLOAD" ]] && {
     [[ "${CLAUDE_HOOK_TYPE:-$RAW_ARG1}" == "PostToolUse" ]] ||
     [[ "${CLAUDE_HOOK_TYPE:-$RAW_ARG1}" == "ResumeAfterInput" ]]
 }; then
@@ -1071,8 +1148,11 @@ else
     TOOL_NAME="${RAW_ARG2:-""}"
     PROJECT_NAME="${RAW_ARG3:-$(get_project_name)}"
 
-    # Read hook data from stdin (Claude Code passes JSON with hook context)
-    if [[ ! -t 0 ]]; then
+    # Normal-mode Codex questions were already read and validated above.
+    if [[ -n "$CODEX_ASYNC_QUESTION_PAYLOAD" ]]; then
+        HOOK_TYPE="notification"
+        HOOK_DATA="$CODEX_ASYNC_QUESTION_PAYLOAD"
+    elif [[ ! -t 0 ]]; then
         HOOK_DATA=$(cat 2>/dev/null || true)
     fi
     if [[ "$TOOL_NAME" == "codex" && -z "$RAW_ARG3" ]]; then
@@ -2055,7 +2135,9 @@ case "$HOOK_TYPE" in
         # The managed Claude AskUserQuestion hook uses this event. Once its
         # answer is supplied, PostToolUse (or the following PreToolUse) resumes
         # the same turn without a UserPromptSubmit event.
-        if [[ "$TOOL_NAME" == "codex" ]]; then
+        if [[ "${CODEX_ASYNC_QUESTION:-0}" == "1" ]]; then
+            : # The displayed question needs an answer; Codex can keep working.
+        elif [[ "$TOOL_NAME" == "codex" ]]; then
             tmux_running_pause_for_input watch 2>/dev/null || true
         else
             tmux_running_pause_for_input 2>/dev/null || true

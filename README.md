@@ -84,7 +84,7 @@ This first CalVer release collects the fork-specific work since upstream
 - **Voice announcements** - Hear when tasks complete (macOS, Windows)
 - **ElevenLabs voices** - Optional high-quality cloud TTS for voice announcements (macOS)
 - **Slack/Discord/ntfy delivery** - Mirror notifications to webhooks or your phone
-- **Codex attention alerts** - Turn completion through Codex hooks; `cn codex` adds human approval and blocking question alerts in ordinary terminals. Opt into every approval request, including Auto-review, with `cn alerts add approval_request`
+- **Codex attention alerts** - Turn completion and normal-mode questions through Codex hooks; `cn codex` adds human approval and blocking question alerts. Opt into every approval request, including Auto-review, with `cn alerts add approval_request`
 - **Usage alerts** - Opt-in Codex/Claude 20%, 10%, and reset notifications
 - **Rotating tool-specific messages** - "Claude is idle", "Codex wrapped up", and other short variants are chosen randomly per event
 - **Project-specific settings** - Different configs per project
@@ -364,19 +364,21 @@ Code-Notify uses the hook systems built into AI coding tools:
 
 For Codex, Code-Notify configures `$CODEX_HOME/hooks.json` (`~/.codex/hooks.json` by default) with lifecycle hooks. The `Stop` hook sends task-complete notifications, including when you run `codex` directly. Unrelated user hooks and `notify` commands are preserved; `cn off codex` restores the previous TUI notification setting.
 
-To receive alerts when Codex actually needs your approval or answer, launch it through Code-Notify:
+On macOS/Linux, `ask_user` also alerts when Codex displays a normal-mode question (`request_user_input_async`), with plain `codex` or `cn codex`. The existing `PostToolUse` hook checks that Codex accepted the question before notifying. These prompts can stay open while Codex continues other work, so the alert leaves its running indicator active. Plan mode is not required, and changing `ask_user` takes effect without reinstalling hooks.
+
+To receive alerts for human approvals and blocking questions too, launch Codex through Code-Notify:
 
 ```bash
 cn on codex                       # Initial setup; start a fresh Codex session afterward
 cn alerts add permission_prompt   # Human approval needed
-cn alerts add ask_user            # Blocking question needs an answer
+cn alerts add ask_user            # A question needs an answer, in normal or Plan mode
 cn codex                          # Your usual Codex terminal interface
 cn codex resume --last            # Codex arguments pass through
 ```
 
 `cn codex` observes the requests sent to the terminal client through Codex's normal local app-server daemon. It does not answer requests or change thread settings. Approvals use `permission_prompt`; blocking questions use `ask_user`; MCP input uses `elicitation_dialog`. All use the existing notifier, sounds, voice, channels, persistence and optional tmux badges. `cn alerts add/remove/reset` takes effect on subsequent requests in a running session without reinstalling hooks. `cn off codex` and snooze also silence these alerts.
 
-Codex's `PermissionRequest` hook runs before Auto-review/Guardian decides whether human approval is needed. By default, these early requests stay silent; `permission_prompt` reports requests actually routed to the user. Guardian progress, optional questions (`isBlocking: false`), and unknown events stay silent. See the [Codex app-server protocol](https://learn.chatgpt.com/docs/app-server) and [hook reference](https://learn.chatgpt.com/docs/hooks).
+Codex's `PermissionRequest` hook runs before Auto-review/Guardian decides whether human approval is needed. By default, these early requests stay silent; `permission_prompt` reports requests actually routed to the user. Guardian progress, unaccepted question calls, and unknown events stay silent. Async questions use the native hook; the launcher handles blocking questions, so the two paths do not duplicate a question alert. See the [Codex app-server protocol](https://learn.chatgpt.com/docs/app-server) and [hook reference](https://learn.chatgpt.com/docs/hooks).
 
 To retain notifications for **every approval request**, including requests that Auto-review resolves automatically, opt in through the existing alert settings:
 
@@ -619,7 +621,7 @@ By default, Claude/Gemini input alerts use `idle_prompt`, while Codex always use
 ```bash
 cn alerts                          # Show current config
 cn alerts add permission_prompt    # Also notify on tool permission requests
-cn alerts add ask_user             # Claude questions / Codex blocking questions
+cn alerts add ask_user             # Claude/Codex questions
 cn alerts add approval_request     # Every Codex request, including Auto-review
 cn alerts add SubagentStop         # Also notify when Claude subagents finish
 cn alerts remove permission_prompt # Remove permission notifications
@@ -628,17 +630,20 @@ cn alerts reset                    # Back to default (idle_prompt only)
 
 | Type                 | Description                                    |
 | -------------------- | ---------------------------------------------- |
+| `stop`               | Task complete (enabled when tool notifications are on) |
 | `idle_prompt`        | AI is waiting for your input (default)         |
 | `permission_prompt`  | AI needs tool permission (Y/n)                 |
 | `approval_request`   | Every Codex approval request, including Auto-review (opt-in) |
 | `auth_success`       | Authentication success                         |
 | `elicitation_dialog` | MCP tool input needed                          |
-| `ask_user`           | Claude asks a question; Codex needs an answer (`cn codex`) |
+| `ask_user`           | Claude/Codex question; blocking Codex questions use `cn codex` |
 | `SubagentStart`      | Claude subagent started                        |
 | `SubagentStop`       | Claude subagent completed                      |
 | `TeammateIdle`       | Claude teammate is waiting for input           |
 | `TaskCreated`        | Claude agent-team task was created             |
 | `TaskCompleted`      | Claude agent-team task completed               |
+
+`stop` appears in the status list independently of the alert matcher. Use `cn alerts persist add stop` to keep completion notifications on screen.
 
 Alert-type matching applies to Claude Code `Notification` and `PermissionRequest` hooks, `cn codex` requests, Gemini CLI notification hooks, the Antigravity CLI `PreToolUse` hook, and opencode's permission/question events. Codex, Antigravity and opencode read their alert settings at runtime; changing them needs no hook rewrite. For Claude, `ask_user` adds a `PreToolUse` hook for `AskUserQuestion` immediately when notifications are already enabled. Claude Code agent/team events are separate hooks and are opt-in via `cn alerts add SubagentStop`, `cn alerts add TeammateIdle`, or `cn alerts add TaskCompleted`. Other Claude/Gemini hook changes may need `cn on`.
 

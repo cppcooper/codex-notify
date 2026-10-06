@@ -73,8 +73,9 @@ ${BOLD}ALERT TYPES:${RESET}
 
     Notification types: ${CYAN}idle_prompt${RESET} (default), ${CYAN}permission_prompt${RESET}, ${CYAN}approval_request${RESET}, ${CYAN}auth_success${RESET}, ${CYAN}elicitation_dialog${RESET}, ${CYAN}ask_user${RESET}
     Claude events: ${CYAN}SubagentStart${RESET}, ${CYAN}SubagentStop${RESET}, ${CYAN}TeammateIdle${RESET}, ${CYAN}TaskCreated${RESET}, ${CYAN}TaskCompleted${RESET}
+    Codex ask_user alerts when normal-mode questions are displayed (macOS/Linux).
     With cn codex: permission_prompt alerts when human approval is required;
-                   ask_user alerts for blocking questions.
+                   ask_user also alerts for blocking questions.
     approval_request opts into every Codex approval request, including Auto-review,
     with plain codex or cn codex. Both approval types can notify if enabled.
     Codex alert changes apply immediately, without reinstalling hooks.

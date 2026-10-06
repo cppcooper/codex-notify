@@ -320,3 +320,95 @@ if grep -q 'ApprovalRequest codex' "$CODEX_HOME/hooks.json"; then
     fail "changing alerts re-enabled disabled Codex hooks"
 fi
 pass "The opt-in honors cn off codex and does not enable disabled tool hooks"
+
+# This is the live PostToolUse shape from a normal-mode question: the tool
+# returns a JSON string after displaying the prompt, without blocking the turn.
+async_question='{"hook_event_name":"PostToolUse","tool_name":"request_user_input_async","tool_use_id":"async-one","cwd":"/tmp/async-demo","session_id":"async-thread","tool_input":{"questions":[{"title":"Which café?","options":["One","Two"]}]},"tool_response":"{\"accepted\":true}"}'
+run_async_question() {
+    printf '%s' "${1:-$async_question}" | PATH="$fake_path" bash "$NOTIFIER" PostToolUse codex
+}
+async_count=$(wc -l < "$notification_log")
+run_async_question
+[[ $(wc -l < "$notification_log") -eq "$async_count" ]] || fail "disabled ask_user alerted"
+(
+    source "$SCRIPT_DIR/../lib/code-notify/core/config.sh"
+    enable_codex_hooks
+)
+async_hooks=$(cat "$CODEX_HOME/hooks.json")
+async_config=$(cat "$CODEX_HOME/config.toml")
+run_alerts_command add ask_user
+
+async_trace=$(printf '%s' "$async_question" | PATH="$fake_path" bash -x "$NOTIFIER" PostToolUse codex 2>&1)
+async_count=$((async_count + 1))
+[[ $(wc -l < "$notification_log") -eq "$async_count" ]] || fail "accepted normal-mode question did not notify"
+tail -n 1 "$notification_log" | grep -q 'Which café?' || fail "normal-mode question title was lost"
+tail -n 1 "$notification_log" | grep -q 'Question - async-demo' || fail "normal-mode question did not reuse the question UX"
+if printf '%s' "$async_trace" | grep -qE '^\++ tmux_running_(pause_for_input|stop)( |$)'; then
+    fail "async question stopped Codex's running indicator"
+fi
+run_async_question "${async_question/async-one/async-two}"
+async_count=$((async_count + 1))
+[[ $(wc -l < "$notification_log") -eq "$async_count" ]] || fail "separate normal-mode questions were rate-limited"
+
+# Test the fallback parser against the same captured result. Restrict only
+# command discovery for jq; all other commands and shared delivery stay real.
+(
+    command() {
+        if [[ "$1" == "-v" && "${2:-}" == "jq" ]]; then return 1; fi
+        builtin command "$@"
+    }
+    export -f command
+    run_async_question "${async_question/async-one/async-python}"
+)
+async_count=$((async_count + 1))
+[[ $(wc -l < "$notification_log") -eq "$async_count" ]] || fail "Python fallback lost the normal-mode question"
+
+python3 - "$async_question" <<'PYASYNC' > "$test_dir/unaccepted-questions.jsonl"
+import json, sys
+event = json.loads(sys.argv[1])
+for response in ('{"accepted":false}', '{"accepted":1}', 'malformed', None):
+    print(json.dumps({**event, "tool_response": response}))
+print(json.dumps({**event, "tool_input": {"questions": []}}))
+print(json.dumps({**event, "tool_input": {"questions": [{"title": None}]}}))
+print(json.dumps({**event, "tool_name": "Bash"}))
+PYASYNC
+while IFS= read -r rejected; do
+    run_async_question "$rejected"
+done < "$test_dir/unaccepted-questions.jsonl"
+[[ $(wc -l < "$notification_log") -eq "$async_count" ]] || fail "unaccepted or unrelated tool events alerted"
+
+# Ordinary PostToolUse events must retain their lightweight resume path.
+ordinary_trace=$(printf '%s' '{"tool_name":"Bash","tool_input":{"command":"pwd"}}' | PATH="$fake_path" bash -x "$NOTIFIER" PostToolUse codex 2>&1)
+if printf '%s' "$ordinary_trace" | grep -qE '^\++ (source|jq|python3)( |$)'; then
+    fail "ordinary tool hooks started a parser or sourced notification utilities"
+fi
+run_alerts_command remove ask_user
+run_async_question
+run_alerts_command add ask_user
+: > "$HOME/.claude/notifications/disabled"
+run_async_question
+rm "$HOME/.claude/notifications/disabled"
+printf '%s\n' "$(( $(date +%s) + 60 ))" > "$HOME/.claude/notifications/snooze-until"
+run_async_question
+rm "$HOME/.claude/notifications/snooze-until"
+[[ $(wc -l < "$notification_log") -eq "$async_count" ]] || fail "async questions ignored alert removal, disablement or snooze"
+[[ "$(cat "$CODEX_HOME/hooks.json")" == "$async_hooks" ]] || fail "async alert changes rewrote hooks"
+[[ "$(cat "$CODEX_HOME/config.toml")" == "$async_config" ]] || fail "async alert changes rewrote unrelated TOML"
+
+run_alerts_command persist add ask_user
+run_alerts_command persist timeout 0
+run_async_question
+async_count=$((async_count + 1))
+[[ $(wc -l < "$notification_log") -eq "$async_count" ]] || fail "persistent normal-mode question was lost"
+if [[ "$(uname -s)" == "Linux" ]]; then
+    tail -n 1 "$notification_log" | grep -q -- '--urgency=critical' || fail "async question did not reuse persistence"
+    tail -n 1 "$notification_log" | grep -q -- '--expire-time=0' || fail "async question did not reuse persistence timeout"
+fi
+wait_for_lines "$sound_log" "$async_count" || fail "async questions did not reuse shared sound delivery"
+(
+    source "$SCRIPT_DIR/../lib/code-notify/core/config.sh"
+    disable_codex_hooks
+)
+run_async_question
+[[ $(wc -l < "$notification_log") -eq "$async_count" ]] || fail "async question bypassed cn off codex"
+pass "Normal-mode questions notify only after acceptance, reuse shared delivery, and honor live settings without pausing Codex"
